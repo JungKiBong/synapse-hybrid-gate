@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synapse-hybrid-gate"
+version = "0.3.0"
+authors = [{name = "JungKiBong"}]
+description = "Zero-dependency, zero-stale LLM outcome & KV-prefix gate over SQLite WAL with Universal Memory Port (Mem0, Zep/Graphiti, Postgres, Mories, or standalone)"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["ai-agents", "llm-cache", "kv-cache", "mem0", "zep", "mcp", "sqlite", "provenance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+synapse-hybrid-gate = "synapse_hybrid_gate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+synapse_hybrid_gate = ["py.typed"]
+
+[project.urls]
+Homepage = "https://github.com/JungKiBong/synapse-hybrid-gate"
+Repository = "https://github.com/JungKiBong/synapse-hybrid-gate"
+Issues = "https://github.com/JungKiBong/synapse-hybrid-gate/issues"
