@@ -333,6 +333,12 @@ class CircuitBreakingAdapter:
     def provider(self) -> str:
         return self._provider
 
+    @property
+    def is_open(self) -> bool:
+        """Returns ``True`` while the circuit breaker is open and fast-failing."""
+        with self._lock:
+            return time.monotonic() < self._open_until
+
     def _open_snapshot(self, item_id: str) -> EvidenceSnapshot:
         reason = (
             "mories_backend_unavailable:circuit_open"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synapse-hybrid-gate"
-version = "0.3.0"
+version = "0.3.1"
 authors = [{name = "JungKiBong"}]
 description = "Zero-dependency, zero-stale LLM outcome & KV-prefix gate over SQLite WAL with Universal Memory Port (Mem0, Zep/Graphiti, Postgres, Mories, or standalone)"
 readme = "README.md"

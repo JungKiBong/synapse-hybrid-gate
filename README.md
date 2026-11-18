@@ -67,13 +67,13 @@ Evaluated across **16 isolated live agent calls** (`6` rounds × `5` cross-docum
 
 </details>
 
-### 2. Engine Runtime, Security & Multi-Process Benchmarks (`v0.3.0`)
+### 2. Engine Runtime, Security & Multi-Process Benchmarks (`v0.3.1`)
 
 | Metric | Verified Result | Scope / Condition |
 |---|---|---|
-| **Verification Suite** | **`32 / 32` PASS** (`34` assertion groups) | `H01`–`H12` hardening + `U01`–`U10` universal port + `F01`–`F12` core gate + isolated wheel (`python3 -I -B`) |
+| **Verification Suites** | **`26 / 26` built-in `unittest` PASS** + **`32 / 32` release suite PASS** | Public `tests/test_synapse_hybrid_gate.py` (`0.35s`) + isolated wheel (`python3 -I -B`) release verification |
 | **8-Subagent Prefix Sharing (`H07`)** | **`95.6%`** shared prefix bytes | 8 parallel subagents querying distinct tasks over shared pinned specifications |
-| **Multi-Process SQLite WAL (`H08`)** | **`0` lock errors** across **6 OS processes** | 4 concurrent `read_only=True` workers + 2 concurrent writers with OCC conflict blocking |
+| **Multi-Process SQLite WAL (`H08`)** | **`0` lock/snapshot errors** across **6 OS processes** | 4 concurrent `read_only=True` MVCC snapshot workers + 2 concurrent writers with OCC conflict blocking |
 | **Memory & Execution Footprint** | **`48.86 MiB` Peak RSS** (`6.37s` full suite) | Pure Python `>=3.11` standard library (`0` external pip dependencies) |
 | **Tamper & Escape Defenses (`H06`, `H07`)** | **`100%` blocked** (`HOLD` / `DENY`) | Dual cache+receipt hash-chain cross-verification, adversarial `</EVIDENCE>` tag escalation (`EVIDENCE_1`), `O_NOFOLLOW` symlink rejection, `0600` DB mode |
 
@@ -82,9 +82,10 @@ Evaluated across **16 isolated live agent calls** (`6` rounds × `5` cross-docum
 ## 5-Minute Quickstart
 
 ```bash
-pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.0
-# Or from a local clone:
+pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.1
+# Or from a local clone (run instant zero-API-key demo in < 0.2s):
 pip install .
+python3 examples/demo_lossless_savings.py
 ```
 
 ### 1. Standalone Lossless LLM Caching, KV-Prefix Pinning & Token Telemetry
@@ -158,7 +159,12 @@ Exit codes: `0` (`ALLOW` / OK), `2` (`HOLD` — stale, revoked, or offline depen
 synapse-hybrid-gate --db gate.db --project-root . init
 synapse-hybrid-gate --db gate.db --project-root . register-local --evidence-id ev:spec --file spec.md
 synapse-hybrid-gate --db gate.db bind-task --task-id task:t1 --title "Check spec" --evidence-id ev:spec
-synapse-hybrid-gate --db gate.db record-receipt --task-id task:t1 --outcome-sha256 $(printf 'a%.0s' {1..64})
+
+# Build KV-prefix-pinned prompt & cache/lookup verified LLM outputs directly from shell hooks (Claude Code / Codex / OpenCode):
+synapse-hybrid-gate --db gate.db --project-root . begin-work --task-id task:t1
+synapse-hybrid-gate --db gate.db --project-root . build-prompt --task-id task:t1 --question "Audit spec invariants" --format json
+synapse-hybrid-gate --db gate.db --project-root . cache-store --task-id task:t1 --prompt-sha256 <SHA256> --payload '{"safe":true}' --input-tokens 1675 --output-tokens 43
+synapse-hybrid-gate --db gate.db --project-root . cache-lookup --task-id task:t1 --prompt-sha256 <SHA256>
 synapse-hybrid-gate --db gate.db --read-only check-task --task-id task:t1
 
 # View cumulative avoided LLM calls, saved input/output tokens, hit rate %, and KV-pinned tokens:
@@ -172,10 +178,11 @@ synapse-hybrid-gate --db gate.db verify-chain
 
 ---
 
-## Running Tests
+## Running Tests & Demo
 
 ```bash
-python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+python3 examples/demo_lossless_savings.py
 ```
 
 ## Enterprise Security & Architectural Boundaries

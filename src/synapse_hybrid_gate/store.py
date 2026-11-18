@@ -582,6 +582,32 @@ class HybridEvidenceGate:
         self._require_writable()
         return self._TxContext(self._conn, self._busy_timeout_ms)
 
+    class _ReadSnapshotContext:
+        """Acquires a zero-blocking SQLite WAL MVCC point-in-time read snapshot across multi-statement reads."""
+
+        def __init__(self, conn: sqlite3.Connection) -> None:
+            self._conn = conn
+            self._started = False
+
+        def __enter__(self) -> sqlite3.Connection:
+            if not self._conn.in_transaction:
+                self._conn.execute("BEGIN DEFERRED")
+                self._started = True
+            return self._conn
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            if self._started and self._conn.in_transaction:
+                try:
+                    if exc_type is None:
+                        self._conn.execute("COMMIT")
+                    else:
+                        self._conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+
+    def _read_snapshot(self) -> _ReadSnapshotContext:
+        return self._ReadSnapshotContext(self._conn)
+
     # ------------------------------------------------------------------
     # Evidence Registration & Lifecycle
     # ------------------------------------------------------------------
@@ -1212,33 +1238,34 @@ class HybridEvidenceGate:
         checks, live external provider inspection, and optional normative action gating.
         """
         validate_identifier(task_id, "task_id")
-        latest = self._conn.execute(
-            """
-            SELECT seq, receipt_id, task_id, decision, reason, dependency_digest,
-                   outcome_sha256, prev_chain_sha256, chain_sha256, created_ns
-            FROM audit_receipts
-            WHERE task_id = ?
-            ORDER BY seq DESC
-            LIMIT 1
-            """,
-            (task_id,),
-        ).fetchone()
-        if latest is None:
-            return GateCheckResult(task_id, "HOLD", "missing_verified_receipt")
+        with self._read_snapshot():
+            latest = self._conn.execute(
+                """
+                SELECT seq, receipt_id, task_id, decision, reason, dependency_digest,
+                       outcome_sha256, prev_chain_sha256, chain_sha256, created_ns
+                FROM audit_receipts
+                WHERE task_id = ?
+                ORDER BY seq DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if latest is None:
+                return GateCheckResult(task_id, "HOLD", "missing_verified_receipt")
 
-        if not self._verify_receipt_row_and_head(latest):
-            return GateCheckResult(task_id, "HOLD", "corrupted_audit_receipt")
+            if not self._verify_receipt_row_and_head(latest):
+                return GateCheckResult(task_id, "HOLD", "corrupted_audit_receipt")
 
-        if latest["decision"] != "ALLOW":
-            return GateCheckResult(
-                task_id,
-                latest["decision"],
-                f"latest_receipt_not_allow:{latest['reason']}",
-                receipt_id=latest["receipt_id"],
-                outcome_sha256=None,
-            )
+            if latest["decision"] != "ALLOW":
+                return GateCheckResult(
+                    task_id,
+                    latest["decision"],
+                    f"latest_receipt_not_allow:{latest['reason']}",
+                    receipt_id=latest["receipt_id"],
+                    outcome_sha256=None,
+                )
 
-        deps = self._fetch_task_dep_rows(task_id)
+            deps = self._fetch_task_dep_rows(task_id)
         if not deps:
             return GateCheckResult(task_id, "HOLD", "missing_task_dependencies")
 
@@ -1402,29 +1429,30 @@ class HybridEvidenceGate:
         if chk.decision != "ALLOW":
             return CachedStepOutcome(task_id, False, chk.decision, chk.reason)
 
-        row = self._conn.execute(
-            """
-            SELECT c.dependency_digest AS cache_dep_digest,
-                   c.outcome_sha256 AS cache_outcome_sha256,
-                   c.payload_text,
-                   c.input_tokens,
-                   c.output_tokens,
-                   r.seq, r.receipt_id, r.task_id, r.decision, r.reason,
-                   r.dependency_digest, r.outcome_sha256,
-                   r.prev_chain_sha256, r.chain_sha256, r.created_ns
-            FROM verified_outcome_cache c
-            JOIN audit_receipts r ON r.receipt_id = c.receipt_id
-            WHERE c.task_id = ? AND c.prompt_sha256 = ?
-            """,
-            (task_id, p_sha),
-        ).fetchone()
-        if row is None:
-            return CachedStepOutcome(task_id, False, "HOLD", "outcome_cache_miss")
+        with self._read_snapshot():
+            row = self._conn.execute(
+                """
+                SELECT c.dependency_digest AS cache_dep_digest,
+                       c.outcome_sha256 AS cache_outcome_sha256,
+                       c.payload_text,
+                       c.input_tokens,
+                       c.output_tokens,
+                       r.seq, r.receipt_id, r.task_id, r.decision, r.reason,
+                       r.dependency_digest, r.outcome_sha256,
+                       r.prev_chain_sha256, r.chain_sha256, r.created_ns
+                FROM verified_outcome_cache c
+                JOIN audit_receipts r ON r.receipt_id = c.receipt_id
+                WHERE c.task_id = ? AND c.prompt_sha256 = ?
+                """,
+                (task_id, p_sha),
+            ).fetchone()
+            if row is None:
+                return CachedStepOutcome(task_id, False, "HOLD", "outcome_cache_miss")
 
-        if not self._verify_receipt_row_and_head(row):
-            return CachedStepOutcome(task_id, False, "HOLD", "corrupted_audit_receipt")
+            if not self._verify_receipt_row_and_head(row):
+                return CachedStepOutcome(task_id, False, "HOLD", "corrupted_audit_receipt")
 
-        deps = self._fetch_task_dep_rows(task_id)
+            deps = self._fetch_task_dep_rows(task_id)
         live_dep_digest = _compute_dependency_digest(
             [(r["evidence_id"], int(r["bound_epoch"]), int(r["bound_revision"]), r["bound_sha256"]) for r in deps]
         )
@@ -1922,31 +1950,32 @@ class HybridEvidenceGate:
 
     def verify_chain(self) -> dict[str, Any]:
         """Verifies every receipt row and head anchor against modification, gap, or tail truncation."""
-        try:
-            meta = {
-                r["key"]: r["value"]
-                for r in self._conn.execute(
-                    "SELECT key, value FROM gate_meta WHERE key IN ('head_seq', 'head_chain_sha256')"
-                ).fetchall()
-            }
-            head_seq = int(meta["head_seq"])
-            head_chain = meta["head_chain_sha256"]
-        except (KeyError, ValueError, TypeError):
-            return {
-                "ok": False,
-                "reason": "corrupted_head_meta",
-                "first_bad_seq": 0,
-                "checked_receipts": 0,
-            }
+        with self._read_snapshot():
+            try:
+                meta = {
+                    r["key"]: r["value"]
+                    for r in self._conn.execute(
+                        "SELECT key, value FROM gate_meta WHERE key IN ('head_seq', 'head_chain_sha256')"
+                    ).fetchall()
+                }
+                head_seq = int(meta["head_seq"])
+                head_chain = meta["head_chain_sha256"]
+            except (KeyError, ValueError, TypeError):
+                return {
+                    "ok": False,
+                    "reason": "corrupted_head_meta",
+                    "first_bad_seq": 0,
+                    "checked_receipts": 0,
+                }
 
-        rows = self._conn.execute(
-            """
-            SELECT seq, receipt_id, task_id, decision, reason, dependency_digest,
-                   outcome_sha256, prev_chain_sha256, chain_sha256, created_ns
-            FROM audit_receipts
-            ORDER BY seq ASC
-            """
-        ).fetchall()
+            rows = self._conn.execute(
+                """
+                SELECT seq, receipt_id, task_id, decision, reason, dependency_digest,
+                       outcome_sha256, prev_chain_sha256, chain_sha256, created_ns
+                FROM audit_receipts
+                ORDER BY seq ASC
+                """
+            ).fetchall()
         expected_prev = GENESIS_CHAIN_HASH
         for idx, r in enumerate(rows, start=1):
             seq = int(r["seq"])

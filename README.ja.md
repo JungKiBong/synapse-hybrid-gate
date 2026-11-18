@@ -67,13 +67,13 @@
 
 </details>
 
-### 2. エンジン実行性能・セキュリティ・マルチプロセス並行性指標（`v0.3.0`）
+### 2. エンジン実行性能・セキュリティ・マルチプロセス並行性指標（`v0.3.1`）
 
 | 検証項目 | 実測値 | 検証範囲・条件 |
 |---|---|---|
-| **統合検証スイート** | **`32 / 32` 全件 PASS**（`34` アサーショングループ） | 堅牢化（`H01`〜`H12`）+ 汎用ポート（`U01`〜`U10`）+ 基本ゲート（`F01`〜`F12`）+ 隔離 Wheel（`python3 -I -B`） |
+| **統合検証スイート** | **内蔵公開 `26 / 26` PASS** + **リリース `32 / 32` PASS** | 公開 `tests/test_synapse_hybrid_gate.py`（`0.35 秒`）+ 隔離 Wheel（`python3 -I -B`） |
 | **8 並列サブエージェント Prefix 共有率（`H07`）** | **`95.6%`** プレフィックスバイト完全一致 | 共通仕様書を参照しつつ個別サブタスクを並列実行する 8 サブエージェント間の比較 |
-| **マルチプロセス SQLite WAL 並行性（`H08`）** | **6 OS プロセスでロックエラー `0` 件** | 同時 `read_only=True` ワーカー 4 プロセス + 同時 Writer 2 プロセスおよび OCC 競合遮断 |
+| **マルチプロセス SQLite WAL 並行性（`H08`）** | **6 OS プロセスでロック・スナップショットエラー `0` 件** | 同時 `read_only=True` MVCC スナップショットワーカー 4 + 同時 Writer 2 および OCC 競合遮断 |
 | **メモリ使用量＆実行時間** | **Peak RSS `48.86 MiB`**（全スイート `6.37 秒`） | 純粋な Python `>=3.11` 標準ライブラリのみ（外部 pip 依存パッケージ `0` 個） |
 | **改ざん検知＆プロンプト脱出防御（`H06`, `H07`）** | **`100%` 遮断（`HOLD` / `DENY`）** | キャッシュ行とハッシュチェーンレシートの二重照合、敵対的 `</EVIDENCE>` タグ自動昇格（`EVIDENCE_1`）、`O_NOFOLLOW` シンボリックリンク拒否、POSIX `0600` 権限 |
 
@@ -82,9 +82,10 @@
 ## 5 分クイックスタート
 
 ```bash
-pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.0
-# またはローカルクローンからインストール：
+pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.1
+# またはローカルクローン後、API キー不要のデモを即座に実行：
 pip install .
+python3 examples/demo_lossless_savings.py
 ```
 
 ### 1. 単体利用での無損失 LLM キャッシュ・KV-Prefix 固定・トークン監視
@@ -158,7 +159,12 @@ with HybridEvidenceGate("gate.db", project_root=".") as gate:
 synapse-hybrid-gate --db gate.db --project-root . init
 synapse-hybrid-gate --db gate.db --project-root . register-local --evidence-id ev:spec --file spec.md
 synapse-hybrid-gate --db gate.db bind-task --task-id task:t1 --title "Check spec" --evidence-id ev:spec
-synapse-hybrid-gate --db gate.db record-receipt --task-id task:t1 --outcome-sha256 $(printf 'a%.0s' {1..64})
+
+# シェルフック（Claude Code / Codex / OpenCode）から直接 KV-Prefix プロンプト生成＆無損失キャッシュ保存・参照：
+synapse-hybrid-gate --db gate.db --project-root . begin-work --task-id task:t1
+synapse-hybrid-gate --db gate.db --project-root . build-prompt --task-id task:t1 --question "仕様の不変条件を監査せよ" --format json
+synapse-hybrid-gate --db gate.db --project-root . cache-store --task-id task:t1 --prompt-sha256 <SHA256> --payload '{"safe":true}' --input-tokens 1675 --output-tokens 43
+synapse-hybrid-gate --db gate.db --project-root . cache-lookup --task-id task:t1 --prompt-sha256 <SHA256>
 synapse-hybrid-gate --db gate.db --read-only check-task --task-id task:t1
 
 # 回避した LLM 呼出回数、節約した入出力トークン数、キャッシュヒット率(%)、KV-Prefix 固定トークン数を表示：
@@ -172,10 +178,11 @@ synapse-hybrid-gate --db gate.db verify-chain
 
 ---
 
-## テストの実行
+## テストとデモの実行
 
 ```bash
-python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+python3 examples/demo_lossless_savings.py
 ```
 
 ## 企業セキュリティとアーキテクチャ境界

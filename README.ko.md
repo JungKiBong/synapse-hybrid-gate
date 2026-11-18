@@ -67,13 +67,13 @@
 
 </details>
 
-### 2. 엔진 런타임 · 보안 · 멀티프로세스 동시성 실측 지표 (`v0.3.0`)
+### 2. 엔진 런타임 · 보안 · 멀티프로세스 동시성 실측 지표 (`v0.3.1`)
 
 | 측정 항목 | 검증 수치 | 검증 범위 및 조건 |
 |---|---|---|
-| **통합 검증 시나리오** | **`32 / 32` 전수 PASS** (`34`개 단언 그룹) | 하드닝(`H01`~`H12`) + 범용 포트(`U01`~`U10`) + 기본 게이트(`F01`~`F12`) + 클린 Wheel(`python3 -I -B`) 격리 실행 |
+| **통합 검증 시나리오** | **공개 내장 `26 / 26` PASS** + **릴리스 `32 / 32` PASS** | 공개 `tests/test_synapse_hybrid_gate.py`(`0.35초` 재현) + 클린 Wheel(`python3 -I -B`) 격리 실행 |
 | **8개 병렬 서브에이전트 프리픽스 공유율 (`H07`)** | **`95.6%`** 바이트 완전 일치 | 공통 아키텍처 스펙 위에서 서로 다른 하위 과업을 병렬 수행하는 8개 서브에이전트 프롬프트 비교 |
-| **멀티프로세스 SQLite WAL 동시성 (`H08`)** | **6개 OS 프로세스 락 에러 `0`건** | 동시 `read_only=True` 워커 4개 + 동시 Writer 2개 병렬 실행 및 OCC 충돌 차단 확인 |
+| **멀티프로세스 SQLite WAL 동시성 (`H08`)** | **6개 OS 프로세스 락·스냅샷 에러 `0`건** | 동시 `read_only=True` MVCC 스냅샷 워커 4개 + 동시 Writer 2개 병렬 실행 및 OCC 충돌 차단 확인 |
 | **메모리 점유율 및 실행 속도** | **Peak RSS `48.86 MiB`** (전체 스위트 `6.37초`) | 순수 Python `>=3.11` 표준 라이브러리만 사용 (외부 패키지 의존성 `0`개) |
 | **위변조 및 프롬프트 탈출 방어 (`H06`, `H07`)** | **`100%` 차단 (`HOLD` / `DENY`)** | 캐시 테이블·해시체인 영수증 이중 무결성 대조, 적대적 `</EVIDENCE>` 구분자 자동 승격(`EVIDENCE_1`), `O_NOFOLLOW` 심볼릭링크 차단, `0600` 권한 강제 |
 
@@ -82,9 +82,10 @@
 ## 5분 빠른 시작 (Quickstart)
 
 ```bash
-pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.0
-# 또는 로컬 클론 폴더에서 설치:
+pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.1
+# 또는 로컬 클론 후 API 키 없이 0.2초 만에 절감 데모 즉시 실행:
 pip install .
+python3 examples/demo_lossless_savings.py
 ```
 
 ### 1. 단독 실행 무손실 LLM 캐싱 · KV-Prefix 고정 · 토큰 절감량 모니터링
@@ -158,7 +159,12 @@ with HybridEvidenceGate("gate.db", project_root=".") as gate:
 synapse-hybrid-gate --db gate.db --project-root . init
 synapse-hybrid-gate --db gate.db --project-root . register-local --evidence-id ev:spec --file spec.md
 synapse-hybrid-gate --db gate.db bind-task --task-id task:t1 --title "Check spec" --evidence-id ev:spec
-synapse-hybrid-gate --db gate.db record-receipt --task-id task:t1 --outcome-sha256 $(printf 'a%.0s' {1..64})
+
+# 비(非)Python 쉘/훅(Claude Code, Codex, OpenCode 등)에서 KV-Prefix 프롬프트 생성 및 무손실 캐시 저장·조회:
+synapse-hybrid-gate --db gate.db --project-root . begin-work --task-id task:t1
+synapse-hybrid-gate --db gate.db --project-root . build-prompt --task-id task:t1 --question "스펙 불변식 검증" --format json
+synapse-hybrid-gate --db gate.db --project-root . cache-store --task-id task:t1 --prompt-sha256 <SHA256> --payload '{"safe":true}' --input-tokens 1675 --output-tokens 43
+synapse-hybrid-gate --db gate.db --project-root . cache-lookup --task-id task:t1 --prompt-sha256 <SHA256>
 synapse-hybrid-gate --db gate.db --read-only check-task --task-id task:t1
 
 # 생략된 LLM 호출 수, 절약된 입·출력 토큰, 캐시 적중률(%), KV-Prefix 고정 토큰 실시간 리포트:
@@ -172,10 +178,11 @@ synapse-hybrid-gate --db gate.db verify-chain
 
 ---
 
-## 테스트 실행
+## 테스트 및 데모 실행
 
 ```bash
-python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+python3 examples/demo_lossless_savings.py
 ```
 
 ## 기업 보안 및 아키텍처 경계 안내

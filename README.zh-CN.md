@@ -67,13 +67,13 @@
 
 </details>
 
-### 2. 引擎运行时、安全性与多进程并发基准指标（`v0.3.0`）
+### 2. 引擎运行时、安全性与多进程并发基准指标（`v0.3.1`）
 
 | 测试维度 | 实测结果 | 验证条件与范围 |
 |---|---|---|
-| **完整验证套件** | **`32 / 32` 全部通过**（`34` 个断言组） | 生产加固（`H01`–`H12`）+ 通用端口（`U01`–`U10`）+ 核心门控（`F01`–`F12`）+ 隔离 Wheel（`python3 -I -B`） |
+| **完整验证套件** | **内置公开 `26 / 26` 通过** + **发布套件 `32 / 32` 通过** | 公开 `tests/test_synapse_hybrid_gate.py`（`0.35 秒`）+ 隔离 Wheel（`python3 -I -B`） |
 | **8 并行子智能体前缀共享率（`H07`）** | **`95.6%`** 前缀字节完全一致 | 8 个并行子智能体基于共享锁定规范文档执行不同子任务 |
-| **多进程 SQLite WAL 并发（`H08`）** | **6 个 OS 进程 `0` 锁错误** | 4 个并发 `read_only=True` 只读进程 + 2 个并发写入进程及乐观并发冲突拦截 |
+| **多进程 SQLite WAL 并发（`H08`）** | **6 个 OS 进程 `0` 锁与快照错误** | 4 个并发 `read_only=True` MVCC 快照进程 + 2 个并发写入进程及乐观并发冲突拦截 |
 | **内存占用与执行耗时** | **峰值 RSS `48.86 MiB`**（全套测试 `6.37 秒`） | 纯 Python `>=3.11` 标准库实现（`0` 外部第三方依赖） |
 | **防篡改与防提示词逃逸（`H06`, `H07`）** | **`100%` 拦截（`HOLD` / `DENY`）** | 缓存行与哈希链回执双重校验、恶意 `</EVIDENCE>` 标签自动升级（`EVIDENCE_1`）、`O_NOFOLLOW` 符号链接拦截、POSIX `0600` 权限 |
 
@@ -82,9 +82,10 @@
 ## 5 分钟快速上手
 
 ```bash
-pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.0
-# 或在本地克隆目录中安装：
+pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.1
+# 或在本地克隆目录中安装并免 API 密钥运行秒级演示：
 pip install .
+python3 examples/demo_lossless_savings.py
 ```
 
 ### 1. 独立运行无损 LLM 缓存、KV-Prefix 锁定与 Token 监控
@@ -158,7 +159,12 @@ with HybridEvidenceGate("gate.db", project_root=".") as gate:
 synapse-hybrid-gate --db gate.db --project-root . init
 synapse-hybrid-gate --db gate.db --project-root . register-local --evidence-id ev:spec --file spec.md
 synapse-hybrid-gate --db gate.db bind-task --task-id task:t1 --title "Check spec" --evidence-id ev:spec
-synapse-hybrid-gate --db gate.db record-receipt --task-id task:t1 --outcome-sha256 $(printf 'a%.0s' {1..64})
+
+# 在 Shell 钩子（Claude Code / Codex / OpenCode）中直接生成 KV-Prefix 提示词并读写无损缓存：
+synapse-hybrid-gate --db gate.db --project-root . begin-work --task-id task:t1
+synapse-hybrid-gate --db gate.db --project-root . build-prompt --task-id task:t1 --question "验证规范不变式" --format json
+synapse-hybrid-gate --db gate.db --project-root . cache-store --task-id task:t1 --prompt-sha256 <SHA256> --payload '{"safe":true}' --input-tokens 1675 --output-tokens 43
+synapse-hybrid-gate --db gate.db --project-root . cache-lookup --task-id task:t1 --prompt-sha256 <SHA256>
 synapse-hybrid-gate --db gate.db --read-only check-task --task-id task:t1
 
 # 查看累计跳过的 LLM 调用次数、节省的输入/输出 Token、命中率(%)与 KV-Prefix 锁定 Token 数：
@@ -172,10 +178,11 @@ synapse-hybrid-gate --db gate.db verify-chain
 
 ---
 
-## 运行测试套件
+## 运行测试与演示
 
 ```bash
-python3 -m unittest discover -s tests -v
+PYTHONPATH=src python3 -m unittest discover -s tests -v
+python3 examples/demo_lossless_savings.py
 ```
 
 ## 企业安全与架构边界说明
