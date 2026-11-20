@@ -1,8 +1,8 @@
 """Vendor-neutral evidence adapters for local files and pluggable external memory stores."""
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 import hashlib
 import os
 from pathlib import Path
@@ -10,12 +10,12 @@ import re
 import stat
 import threading
 import time
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
 
 from .exceptions import PathSecurityError, ValidationError
 
 
-VALID_STATES = ("ACTIVE", "REVOKED", "UNAVAILABLE")
+VALID_STATES = ("ACTIVE", "REVOKED", "UNAVAILABLE", "UNKNOWN")
 DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB DoS ceiling
 _PROVIDER_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -59,6 +59,7 @@ class EvidenceSnapshot:
     state: str
     certified: bool
     reason: str = "ok"
+    metadata: dict[str, Any] | None = field(default=None, hash=False)
 
     @property
     def provider(self) -> str:
@@ -76,6 +77,7 @@ class ExternalMemoryItem:
     state: str = "ACTIVE"
     certified: bool = True
     provider: str = "external"
+    metadata: dict[str, Any] | None = field(default=None, hash=False)
 
     def __post_init__(self) -> None:
         validate_identifier(self.item_id, "external_item_id")
@@ -83,11 +85,15 @@ class ExternalMemoryItem:
             raise ValidationError("invalid_external_revision")
         normalized_sha = validate_sha256(self.content_sha256, "external_content_sha256")
         object.__setattr__(self, "content_sha256", normalized_sha)
-        if self.state not in ("ACTIVE", "REVOKED"):
+        if self.state not in ("ACTIVE", "REVOKED", "UNKNOWN"):
             raise ValidationError("invalid_external_state")
         if not isinstance(self.certified, bool):
             raise ValidationError("invalid_external_certified")
         validate_provider(self.provider, allow_local=False)
+        if self.metadata is not None:
+            if not isinstance(self.metadata, Mapping):
+                raise ValidationError("invalid_external_metadata")
+            object.__setattr__(self, "metadata", dict(self.metadata))
 
 
 @dataclass(frozen=True)
@@ -177,6 +183,12 @@ class CallableExternalAdapter:
             raise ValidationError("external_item_id_mismatch")
         if item.provider not in ("external", self._provider):
             raise ValidationError("external_item_provider_mismatch")
+        if item.state == "ACTIVE":
+            reason = "ok"
+        elif item.state == "REVOKED":
+            reason = "evidence_revoked"
+        else:
+            reason = "evidence_unknown"
         return EvidenceSnapshot(
             evidence_id=item_id,
             backend=self._provider,
@@ -185,7 +197,8 @@ class CallableExternalAdapter:
             content_sha256=item.content_sha256,
             state=item.state,
             certified=item.certified,
-            reason="ok" if item.state == "ACTIVE" else "evidence_revoked",
+            reason=reason,
+            metadata=dict(item.metadata) if item.metadata is not None else None,
         )
 
     def inspect(self, item_id: str) -> EvidenceSnapshot:

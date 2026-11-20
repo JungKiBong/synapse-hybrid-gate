@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synapse-hybrid-gate"
-version = "0.3.1"
+version = "0.3.2"
 authors = [{name = "JungKiBong"}]
 description = "Zero-dependency, zero-stale LLM outcome & KV-prefix gate over SQLite WAL with Universal Memory Port (Mem0, Zep/Graphiti, Postgres, Mories, or standalone)"
 readme = "README.md"
@@ -37,6 +37,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 synapse_hybrid_gate = ["py.typed"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
 
 [project.urls]
 Homepage = "https://github.com/JungKiBong/synapse-hybrid-gate"

@@ -2,6 +2,18 @@
 
 All notable changes to `synapse-hybrid-gate` are documented in this file.
 
+## [0.3.2] - 2026-11-21
+
+### Fixed
+- **KV-Prefix Stability Ordering**: Added deterministic ordering via `bind_seq`, `last_mutated_ns`, and optional `pin_order` across `bind_task`, `partition_for_kv_cache`, and `build_kv_pinned_prompt` (with backward-compatible read-only access and idempotent `migrate_database` support for pre-patch `v3` databases), preventing alphabetical re-sort prefix thrashing when mutated evidence is re-bound.
+- **Question XML Delimiter Isolation**: Isolated `<CONTEXT>`/`<EVIDENCE>` delimiter escalation strictly to `system_header` + evidence payloads and escalated `<QUESTION>` tags independently, ensuring user questions referencing `<EVIDENCE>` or `</CONTEXT>` never invalidate the cached KV prefix.
+- **Batched External Provider Inspection**: Consolidated external dependency checks inside `build_kv_pinned_prompt` and `partition_for_kv_cache` into a single batched `inspect_many` call per external provider (with single-pass `inspect` fallback), eliminating redundant `2N` per-item RPC overhead.
+- **Zep Adapter Temporal `as_of` TTL Evaluation**: Fixed `make_zep_adapter` to evaluate temporal bounds against `as_of` / `as_of_fn` rather than treating any non-empty field as revoked—future `invalid_at`/`expired_at` stays `ACTIVE`, empty/whitespace strings are treated as unset, and `valid_at > as_of` or malformed timestamps fail closed to `UNKNOWN`.
+- **Mories Adapter Metadata Preservation**: Preserved rich Mories snapshot metadata (`namespace`, `namespace_epoch`, `collection_epoch`, `valid_from`, `valid_to`, `last_mutated_ns`, `pin_seq`, `verbatim_text`) on `EvidenceSnapshot.metadata` (with fail-closed validation and SHA-256 verification for `verbatim_text`).
+
+### Added
+- **KV-Prefix & Adapter Regression Suite**: Added 8 targeted regression tests in `tests/test_kv_and_plugins_regressions.py` (`34 passed` total).
+
 ## [0.3.1] - 2026-11-18
 
 ### Added

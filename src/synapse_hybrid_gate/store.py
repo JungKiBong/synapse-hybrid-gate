@@ -3,7 +3,7 @@ and parallel optimistic-concurrency gate with Universal Memory Port.
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import html
@@ -113,6 +113,37 @@ def _apply_owner_only_permissions(path: Path) -> None:
             pass
 
 
+def _ensure_kv_order_columns(conn: sqlite3.Connection) -> bool:
+    """Idempotently adds KV-prefix stable ordering columns on existing SQLite schemas."""
+    changed = False
+    ev_cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(evidence_sources)").fetchall()
+    }
+    if ev_cols and "last_mutated_ns" not in ev_cols:
+        conn.execute(
+            "ALTER TABLE evidence_sources ADD COLUMN last_mutated_ns INTEGER NOT NULL DEFAULT 0"
+        )
+        changed = True
+
+    dep_cols = {
+        r["name"]
+        for r in conn.execute("PRAGMA table_info(task_dependencies)").fetchall()
+    }
+    if dep_cols:
+        if "bind_seq" not in dep_cols:
+            conn.execute(
+                "ALTER TABLE task_dependencies ADD COLUMN bind_seq INTEGER NOT NULL DEFAULT 0"
+            )
+            changed = True
+        if "last_mutated_ns" not in dep_cols:
+            conn.execute(
+                "ALTER TABLE task_dependencies ADD COLUMN last_mutated_ns INTEGER NOT NULL DEFAULT 0"
+            )
+            changed = True
+    return changed
+
+
 def migrate_database(db_path: str | Path, *, secure_permissions: bool = True) -> dict[str, Any]:
     """Atomically upgrades a ``v1`` (0.1.0) or ``v2`` (0.2.0) SQLite database to ``v3`` (0.3.0).
 
@@ -152,8 +183,9 @@ def migrate_database(db_path: str | Path, *, secure_permissions: bool = True) ->
                 raise SchemaVersionError("corrupted_gate_meta")
             current = meta.get("schema")
             if current == SCHEMA_VERSION:
+                patched = _ensure_kv_order_columns(conn)
                 conn.execute("COMMIT")
-                return {"migrated_from": SCHEMA_VERSION, "migrated_to": SCHEMA_VERSION, "changed": False}
+                return {"migrated_from": SCHEMA_VERSION, "migrated_to": SCHEMA_VERSION, "changed": patched}
             if current not in (LEGACY_SCHEMA_V1, LEGACY_SCHEMA_V2):
                 raise SchemaVersionError("incompatible_schema_version")
 
@@ -173,6 +205,7 @@ def migrate_database(db_path: str | Path, *, secure_permissions: bool = True) ->
                         certified INTEGER NOT NULL CHECK(certified IN (0, 1)),
                         require_certified INTEGER NOT NULL CHECK(require_certified IN (0, 1)),
                         updated_ns INTEGER NOT NULL,
+                        last_mutated_ns INTEGER NOT NULL DEFAULT 0,
                         CHECK((kind = 'local' AND provider = 'local') OR (kind = 'external' AND provider <> 'local'))
                     )
                     """
@@ -181,7 +214,7 @@ def migrate_database(db_path: str | Path, *, secure_permissions: bool = True) ->
                     """
                     INSERT INTO evidence_sources_v3(
                         evidence_id, kind, provider, uri, external_id, epoch, active_revision,
-                        content_sha256, state, certified, require_certified, updated_ns
+                        content_sha256, state, certified, require_certified, updated_ns, last_mutated_ns
                     )
                     SELECT
                         evidence_id,
@@ -195,13 +228,16 @@ def migrate_database(db_path: str | Path, *, secure_permissions: bool = True) ->
                         state,
                         certified,
                         require_certified,
-                        updated_ns
+                        updated_ns,
+                        0
                     FROM evidence_sources
                     """
                 )
                 conn.execute("DROP TABLE evidence_sources")
                 conn.execute("ALTER TABLE evidence_sources_v3 RENAME TO evidence_sources")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_provider ON evidence_sources(provider)")
+
+            _ensure_kv_order_columns(conn)
 
             conn.execute(
                 """
@@ -406,6 +442,16 @@ class HybridEvidenceGate:
         except sqlite3.Error as exc:
             raise SchemaVersionError("corrupted_gate_meta") from exc
         effective_raw_root = self._bind_verified_root(meta, supplied_root, raw_project_root)
+        dep_cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(task_dependencies)").fetchall()
+        }
+        ev_cols = {
+            r["name"]
+            for r in self._conn.execute("PRAGMA table_info(evidence_sources)").fetchall()
+        }
+        self._has_dep_order_cols = "bind_seq" in dep_cols and "last_mutated_ns" in dep_cols
+        self._has_ev_mutated_col = "last_mutated_ns" in ev_cols
         self._local = LocalFileEvidenceAdapter(effective_raw_root, max_file_bytes=self._max_file_bytes)
 
     def _init_schema(self, supplied_root: Path | None, *, raw_project_root: Path | None) -> None:
@@ -430,6 +476,7 @@ class HybridEvidenceGate:
                 certified INTEGER NOT NULL CHECK(certified IN (0, 1)),
                 require_certified INTEGER NOT NULL CHECK(require_certified IN (0, 1)),
                 updated_ns INTEGER NOT NULL,
+                last_mutated_ns INTEGER NOT NULL DEFAULT 0,
                 CHECK((kind = 'local' AND provider = 'local') OR (kind = 'external' AND provider <> 'local'))
             )
             """,
@@ -448,6 +495,8 @@ class HybridEvidenceGate:
                 bound_epoch INTEGER NOT NULL CHECK(bound_epoch >= 1),
                 bound_revision INTEGER NOT NULL CHECK(bound_revision >= 1),
                 bound_sha256 TEXT NOT NULL,
+                bind_seq INTEGER NOT NULL DEFAULT 0,
+                last_mutated_ns INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (task_id, evidence_id)
             )
             """,
@@ -525,6 +574,7 @@ class HybridEvidenceGate:
                 self._conn.execute(
                     "ALTER TABLE verified_outcome_cache ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0"
                 )
+            _ensure_kv_order_columns(self._conn)
             meta = {
                 r["key"]: r["value"]
                 for r in self._conn.execute("SELECT key, value FROM gate_meta").fetchall()
@@ -549,6 +599,8 @@ class HybridEvidenceGate:
                 for k in counter_keys:
                     self._conn.execute("INSERT OR IGNORE INTO gate_meta(key, value) VALUES (?, '0')", (k,))
 
+        self._has_dep_order_cols = True
+        self._has_ev_mutated_col = True
         self._local = LocalFileEvidenceAdapter(effective_raw_root, max_file_bytes=self._max_file_bytes)
 
     class _TxContext:
@@ -611,6 +663,13 @@ class HybridEvidenceGate:
     # ------------------------------------------------------------------
     # Evidence Registration & Lifecycle
     # ------------------------------------------------------------------
+    def _next_evidence_mutated_ns(self, now_ns: int) -> int:
+        row = self._conn.execute(
+            "SELECT COALESCE(MAX(last_mutated_ns), 0) AS max_ns FROM evidence_sources"
+        ).fetchone()
+        max_ns = int(row["max_ns"]) if row is not None else 0
+        return max(now_ns, max_ns + 1)
+
     def register_local_evidence(self, evidence_id: str, file_path: str | Path) -> EvidenceSnapshot:
         """Registers or updates a regular local file evidence pointer.
 
@@ -631,7 +690,10 @@ class HybridEvidenceGate:
         now_ns = time.time_ns()
         with self._tx():
             existing = self._conn.execute(
-                "SELECT kind, provider, uri, epoch, active_revision, content_sha256, state FROM evidence_sources WHERE evidence_id = ?",
+                """
+                SELECT kind, provider, uri, epoch, active_revision, content_sha256, state, last_mutated_ns
+                FROM evidence_sources WHERE evidence_id = ?
+                """,
                 (evidence_id,),
             ).fetchone()
             if existing is None:
@@ -640,36 +702,38 @@ class HybridEvidenceGate:
                     """
                     INSERT INTO evidence_sources(
                         evidence_id, kind, provider, uri, external_id, epoch, active_revision,
-                        content_sha256, state, certified, require_certified, updated_ns
-                    ) VALUES (?, 'local', 'local', ?, ?, 1, ?, ?, 'ACTIVE', 1, 1, ?)
+                        content_sha256, state, certified, require_certified, updated_ns, last_mutated_ns
+                    ) VALUES (?, 'local', 'local', ?, ?, 1, ?, ?, 'ACTIVE', 1, 1, ?, 0)
                     """,
                     (evidence_id, stored_uri, stored_uri, rev, digest, now_ns),
                 )
             else:
                 if existing["kind"] != "local" or existing["provider"] != "local":
                     raise EvidenceConflictError("evidence_backend_mismatch")
+                unchanged = (
+                    existing["content_sha256"] == digest
+                    and existing["state"] == "ACTIVE"
+                    and existing["uri"] == stored_uri
+                )
                 epoch = (
                     int(existing["epoch"]) + 1
                     if existing["state"] != "ACTIVE" or existing["uri"] != stored_uri
                     else int(existing["epoch"])
                 )
-                rev = (
-                    int(existing["active_revision"])
-                    if (
-                        existing["content_sha256"] == digest
-                        and existing["state"] == "ACTIVE"
-                        and existing["uri"] == stored_uri
-                    )
-                    else int(existing["active_revision"]) + 1
+                rev = int(existing["active_revision"]) if unchanged else int(existing["active_revision"]) + 1
+                mutated_ns = (
+                    int(existing["last_mutated_ns"])
+                    if unchanged
+                    else self._next_evidence_mutated_ns(now_ns)
                 )
                 self._conn.execute(
                     """
                     UPDATE evidence_sources
                     SET uri = ?, external_id = ?, epoch = ?, active_revision = ?, content_sha256 = ?,
-                        state = 'ACTIVE', certified = 1, updated_ns = ?
+                        state = 'ACTIVE', certified = 1, updated_ns = ?, last_mutated_ns = ?
                     WHERE evidence_id = ?
                     """,
-                    (stored_uri, stored_uri, epoch, rev, digest, now_ns, evidence_id),
+                    (stored_uri, stored_uri, epoch, rev, digest, now_ns, mutated_ns, evidence_id),
                 )
         return EvidenceSnapshot(
             evidence_id=evidence_id,
@@ -738,12 +802,16 @@ class HybridEvidenceGate:
             state=snap.state,
             certified=snap.certified,
             reason=snap.reason,
+            metadata=dict(snap.metadata) if snap.metadata is not None else None,
         )
 
         now_ns = time.time_ns()
         with self._tx():
             existing = self._conn.execute(
-                "SELECT kind, provider, external_id, epoch, state FROM evidence_sources WHERE evidence_id = ?",
+                """
+                SELECT kind, provider, external_id, epoch, active_revision, content_sha256, state, last_mutated_ns
+                FROM evidence_sources WHERE evidence_id = ?
+                """,
                 (evidence_id,),
             ).fetchone()
             if existing is None:
@@ -751,8 +819,8 @@ class HybridEvidenceGate:
                     """
                     INSERT INTO evidence_sources(
                         evidence_id, kind, provider, uri, external_id, epoch, active_revision,
-                        content_sha256, state, certified, require_certified, updated_ns
-                    ) VALUES (?, 'external', ?, ?, ?, 1, ?, ?, 'ACTIVE', ?, ?, ?)
+                        content_sha256, state, certified, require_certified, updated_ns, last_mutated_ns
+                    ) VALUES (?, 'external', ?, ?, ?, 1, ?, ?, 'ACTIVE', ?, ?, ?, 0)
                     """,
                     (
                         evidence_id,
@@ -776,12 +844,23 @@ class HybridEvidenceGate:
                     if existing["external_id"] != item_id
                     else int(existing["epoch"])
                 )
+                unchanged = (
+                    existing["external_id"] == item_id
+                    and existing["state"] == "ACTIVE"
+                    and int(existing["active_revision"]) == normalized_snap.revision
+                    and existing["content_sha256"] == validated_sha
+                )
+                mutated_ns = (
+                    int(existing["last_mutated_ns"])
+                    if unchanged
+                    else self._next_evidence_mutated_ns(now_ns)
+                )
                 self._conn.execute(
                     """
                     UPDATE evidence_sources
                     SET uri = ?, external_id = ?, epoch = ?, active_revision = ?,
                         content_sha256 = ?, state = 'ACTIVE', certified = ?,
-                        require_certified = ?, updated_ns = ?
+                        require_certified = ?, updated_ns = ?, last_mutated_ns = ?
                     WHERE evidence_id = ?
                     """,
                     (
@@ -793,6 +872,7 @@ class HybridEvidenceGate:
                         int(normalized_snap.certified),
                         int(require_certified),
                         now_ns,
+                        mutated_ns,
                         evidence_id,
                     ),
                 )
@@ -853,13 +933,15 @@ class HybridEvidenceGate:
         validate_identifier(evidence_id, "evidence_id")
         now_ns = time.time_ns()
         with self._tx():
+            mutated_ns = self._next_evidence_mutated_ns(now_ns)
             cur = self._conn.execute(
                 """
                 UPDATE evidence_sources
-                SET state = 'REVOKED', epoch = epoch + 1, active_revision = active_revision + 1, updated_ns = ?
+                SET state = 'REVOKED', epoch = epoch + 1, active_revision = active_revision + 1,
+                    updated_ns = ?, last_mutated_ns = ?
                 WHERE evidence_id = ?
                 """,
-                (now_ns, evidence_id),
+                (now_ns, mutated_ns, evidence_id),
             )
             if cur.rowcount == 0:
                 raise ValidationError("unknown_evidence_id")
@@ -893,44 +975,219 @@ class HybridEvidenceGate:
                 (task_id, title.strip(), time.time_ns()),
             )
 
-    def bind_task(self, task_id: str, evidence_ids: Iterable[str]) -> str:
-        """Binds ``task_id`` to the current active ``(epoch, revision, sha256)`` of ``evidence_ids``."""
+    @staticmethod
+    def _validate_pin_order(
+        pin_order: Sequence[str] | None,
+        *,
+        allowed_ids: set[str] | None = None,
+    ) -> list[str] | None:
+        if pin_order is None:
+            return None
+        if isinstance(pin_order, (str, bytes)) or not isinstance(pin_order, Iterable):
+            raise ValidationError("invalid_pin_order")
+        seen: set[str] = set()
+        validated: list[str] = []
+        for raw_eid in pin_order:
+            eid = validate_identifier(raw_eid, "evidence_id")
+            if eid in seen:
+                raise ValidationError(f"duplicate_pin_order_evidence_id:{eid}")
+            if allowed_ids is not None and eid not in allowed_ids:
+                raise ValidationError(f"pin_order_unknown_evidence_id:{eid}")
+            seen.add(eid)
+            validated.append(eid)
+        return validated
+
+    @classmethod
+    def _order_kv_rows(
+        cls,
+        rows: list[sqlite3.Row],
+        *,
+        pin_order: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
+        pin_list = cls._validate_pin_order(pin_order)
+        if pin_list:
+            pin_rank = {eid: idx for idx, eid in enumerate(pin_list)}
+            ordered = sorted(
+                rows,
+                key=lambda r: (
+                    0 if r["evidence_id"] in pin_rank else 1,
+                    pin_rank.get(r["evidence_id"], 0),
+                    int(r["last_mutated_ns"]),
+                    int(r["bind_seq"]),
+                    str(r["evidence_id"]),
+                ),
+            )
+        else:
+            ordered = sorted(
+                rows,
+                key=lambda r: (
+                    int(r["last_mutated_ns"]),
+                    int(r["bind_seq"]),
+                    str(r["evidence_id"]),
+                ),
+            )
+        return tuple(str(r["evidence_id"]) for r in ordered)
+
+    def bind_task(
+        self,
+        task_id: str,
+        evidence_ids: Iterable[str],
+        *,
+        pin_order: Sequence[str] | None = None,
+    ) -> str:
+        """Binds ``task_id`` to the current active ``(epoch, revision, sha256)`` of ``evidence_ids``.
+
+        Preserves deterministic KV-prefix ordering metadata (``bind_seq``, ``last_mutated_ns``)
+        so unchanged dependencies keep their existing prefix positions while mutated or newly
+        added dependencies advance monotonically to the tail. Pass ``pin_order`` to explicitly
+        pin specific evidence IDs in a caller-chosen order.
+        """
         self._require_writable()
         validate_identifier(task_id, "task_id")
         ev_list = sorted({validate_identifier(eid, "evidence_id") for eid in evidence_ids})
         if not ev_list:
             raise ValidationError("empty_evidence_bindings")
+        pin_list = self._validate_pin_order(pin_order, allowed_ids=set(ev_list))
+        now_ns = time.time_ns()
         with self._tx():
             t_row = self._conn.execute(
                 "SELECT task_id FROM task_specs WHERE task_id = ?", (task_id,)
             ).fetchone()
             if t_row is None:
                 raise ValidationError("unknown_task_id")
-            self._conn.execute("DELETE FROM task_dependencies WHERE task_id = ?", (task_id,))
-            digest_rows: list[tuple[str, int, int, str]] = []
+
+            prev_rows = self._conn.execute(
+                """
+                SELECT evidence_id, bound_epoch, bound_revision, bound_sha256, bind_seq, last_mutated_ns
+                FROM task_dependencies
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            ).fetchall()
+            prev_by_id = {
+                str(r["evidence_id"]): (
+                    int(r["bound_epoch"]),
+                    int(r["bound_revision"]),
+                    str(r["bound_sha256"]),
+                    int(r["bind_seq"]),
+                    int(r["last_mutated_ns"]),
+                )
+                for r in prev_rows
+            }
+
+            ev_rows: dict[str, sqlite3.Row] = {}
             for eid in ev_list:
                 ev = self._conn.execute(
-                    "SELECT epoch, active_revision, content_sha256, state FROM evidence_sources WHERE evidence_id = ?",
+                    """
+                    SELECT epoch, active_revision, content_sha256, state, last_mutated_ns
+                    FROM evidence_sources WHERE evidence_id = ?
+                    """,
                     (eid,),
                 ).fetchone()
                 if ev is None:
                     raise ValidationError(f"unknown_evidence_id:{eid}")
                 if ev["state"] != "ACTIVE":
                     raise EvidenceConflictError(f"cannot_bind_revoked_evidence:{eid}")
+                ev_rows[eid] = ev
+
+            assignments: dict[str, tuple[int, int]] = {}
+            if pin_list is not None:
+                pin_rank = {eid: idx for idx, eid in enumerate(pin_list, start=1)}
+                for eid, seq in pin_rank.items():
+                    assignments[eid] = (seq, 0)
+                remaining = [eid for eid in ev_list if eid not in pin_rank]
+                next_seq = len(pin_rank) + 1
+                monotonic_mut_ns = max((v[4] for v in prev_by_id.values()), default=0)
+                if not prev_by_id:
+                    for eid in remaining:
+                        assignments[eid] = (next_seq, int(ev_rows[eid]["last_mutated_ns"]))
+                        next_seq += 1
+                else:
+                    rem_unchanged: list[tuple[int, int, str]] = []
+                    rem_changed: list[str] = []
+                    for eid in remaining:
+                        ev = ev_rows[eid]
+                        prev = prev_by_id.get(eid)
+                        if prev is not None and (
+                            int(ev["epoch"]) == prev[0]
+                            and int(ev["active_revision"]) == prev[1]
+                            and str(ev["content_sha256"]) == prev[2]
+                        ):
+                            rem_unchanged.append((prev[4], prev[3], eid))
+                        else:
+                            rem_changed.append(eid)
+                    rem_unchanged.sort()
+                    for prev_mut, _, eid in rem_unchanged:
+                        assignments[eid] = (next_seq, prev_mut)
+                        next_seq += 1
+                    rem_changed.sort(key=lambda eid: (int(ev_rows[eid]["last_mutated_ns"]), eid))
+                    for eid in rem_changed:
+                        ev_mut = int(ev_rows[eid]["last_mutated_ns"])
+                        cand = ev_mut if ev_mut > monotonic_mut_ns else max(now_ns, monotonic_mut_ns + 1)
+                        monotonic_mut_ns = cand
+                        assignments[eid] = (next_seq, cand)
+                        next_seq += 1
+            elif not prev_by_id:
+                for idx, eid in enumerate(ev_list, start=1):
+                    assignments[eid] = (idx, int(ev_rows[eid]["last_mutated_ns"]))
+            else:
+                next_seq = max((v[3] for v in prev_by_id.values()), default=0) + 1
+                monotonic_mut_ns = max((v[4] for v in prev_by_id.values()), default=0)
+                changed_or_new: list[str] = []
+                for eid in ev_list:
+                    ev = ev_rows[eid]
+                    prev = prev_by_id.get(eid)
+                    if prev is not None and (
+                        int(ev["epoch"]) == prev[0]
+                        and int(ev["active_revision"]) == prev[1]
+                        and str(ev["content_sha256"]) == prev[2]
+                    ):
+                        assignments[eid] = (prev[3], prev[4])
+                    else:
+                        changed_or_new.append(eid)
+                changed_or_new.sort(key=lambda eid: (int(ev_rows[eid]["last_mutated_ns"]), eid))
+                for eid in changed_or_new:
+                    ev_mut = int(ev_rows[eid]["last_mutated_ns"])
+                    cand = ev_mut if ev_mut > monotonic_mut_ns else max(now_ns, monotonic_mut_ns + 1)
+                    monotonic_mut_ns = cand
+                    assignments[eid] = (next_seq, cand)
+                    next_seq += 1
+
+            self._conn.execute("DELETE FROM task_dependencies WHERE task_id = ?", (task_id,))
+            digest_rows: list[tuple[str, int, int, str]] = []
+            for eid in ev_list:
+                ev = ev_rows[eid]
+                bind_seq, last_mutated_ns = assignments[eid]
                 self._conn.execute(
                     """
-                    INSERT INTO task_dependencies(task_id, evidence_id, bound_epoch, bound_revision, bound_sha256)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO task_dependencies(
+                        task_id, evidence_id, bound_epoch, bound_revision, bound_sha256,
+                        bind_seq, last_mutated_ns
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (task_id, eid, ev["epoch"], ev["active_revision"], ev["content_sha256"]),
+                    (
+                        task_id,
+                        eid,
+                        ev["epoch"],
+                        ev["active_revision"],
+                        ev["content_sha256"],
+                        bind_seq,
+                        last_mutated_ns,
+                    ),
                 )
                 digest_rows.append((eid, int(ev["epoch"]), int(ev["active_revision"]), ev["content_sha256"]))
         return _compute_dependency_digest(digest_rows)
 
     def _fetch_task_dep_rows(self, task_id: str) -> list[sqlite3.Row]:
+        order_cols = (
+            "d.bind_seq, d.last_mutated_ns"
+            if self._has_dep_order_cols
+            else "0 AS bind_seq, 0 AS last_mutated_ns"
+        )
         return self._conn.execute(
-            """
+            f"""
             SELECT d.evidence_id, d.bound_epoch, d.bound_revision, d.bound_sha256,
+                   {order_cols},
                    e.kind, e.provider, e.uri, e.external_id, e.epoch AS current_epoch, e.active_revision,
                    e.state AS recorded_state, e.require_certified
             FROM task_dependencies d
@@ -941,12 +1198,21 @@ class HybridEvidenceGate:
             (task_id,),
         ).fetchall()
 
-    def _inspect_live_dep_rows(self, deps: list[sqlite3.Row]) -> tuple[bool, str, list[tuple[str, str]]]:
-        """Verifies all bound dependencies against live files and external providers (batch-capable)."""
+    def _batch_inspect_external_deps(
+        self,
+        deps: list[sqlite3.Row],
+    ) -> tuple[dict[tuple[str, str], EvidenceSnapshot], dict[str, str]]:
+        """Performs at most one batched ``inspect_many`` RPC per external provider (fallback to ``inspect``)."""
         ext_by_provider: dict[str, list[str]] = {}
+        seen_by_provider: dict[str, set[str]] = {}
         for r in deps:
             if r["kind"] == "external":
-                ext_by_provider.setdefault(r["provider"], []).append(r["external_id"])
+                prov = str(r["provider"])
+                xid = str(r["external_id"])
+                seen = seen_by_provider.setdefault(prov, set())
+                if xid not in seen:
+                    seen.add(xid)
+                    ext_by_provider.setdefault(prov, []).append(xid)
 
         batched_snaps: dict[tuple[str, str], EvidenceSnapshot] = {}
         batch_errors: dict[str, str] = {}
@@ -957,21 +1223,91 @@ class HybridEvidenceGate:
                 batch_errors[prov] = "corrupted_evidence_provider"
                 continue
             adapter = self._resolve_provider(slug)
-            if len(ext_ids) > 1 and callable(getattr(adapter, "inspect_many", None)):
+            inspect_many = getattr(adapter, "inspect_many", None)
+            if callable(inspect_many):
                 try:
-                    many = adapter.inspect_many(ext_ids)
+                    many = inspect_many(ext_ids)
+                    if not isinstance(many, Mapping):
+                        raise TypeError("invalid_inspect_many_result")
                     for xid, snap in many.items():
-                        batched_snaps[(slug, xid)] = snap
+                        batched_snaps[(slug, str(xid))] = snap
                 except Exception as exc:
                     batch_errors[prov] = (
                         f"mories_backend_unavailable:{type(exc).__name__}"
                         if slug == "mories"
                         else f"external_backend_unavailable:{slug}:{type(exc).__name__}"
                     )
+            else:
+                for xid in ext_ids:
+                    try:
+                        batched_snaps[(slug, xid)] = adapter.inspect(xid)
+                    except Exception as exc:
+                        err_prefix = (
+                            f"mories_backend_unavailable:{type(exc).__name__}"
+                            if slug == "mories"
+                            else f"external_backend_unavailable:{slug}:{type(exc).__name__}"
+                        )
+                        batched_snaps[(slug, xid)] = EvidenceSnapshot(
+                            evidence_id=xid,
+                            backend=slug,
+                            uri=f"{slug}://{xid}",
+                            revision=0,
+                            content_sha256="0" * 64,
+                            state="UNAVAILABLE",
+                            certified=False,
+                            reason=err_prefix,
+                        )
+        return batched_snaps, batch_errors
+
+    @staticmethod
+    def _evaluate_external_dep_snapshot(
+        r: sqlite3.Row,
+        snap: EvidenceSnapshot | None,
+        batch_error: str | None,
+    ) -> tuple[bool, str, str | None]:
+        eid = str(r["evidence_id"])
+        if r["recorded_state"] != "ACTIVE":
+            return False, f"evidence_revoked:{eid}", None
+        if int(r["current_epoch"]) != int(r["bound_epoch"]):
+            return False, f"evidence_epoch_changed_after_revocation:{eid}", None
+        prov = str(r["provider"])
+        if batch_error is not None:
+            return False, f"{batch_error}:{eid}", None
+        try:
+            slug = validate_provider(prov, allow_local=False)
+        except ValidationError:
+            return False, f"corrupted_evidence_provider:{eid}", None
+
+        if snap is None:
+            not_found = "mories_item_not_found" if slug == "mories" else f"external_item_not_found:{slug}"
+            return False, f"{not_found}:{eid}", None
+        if not isinstance(snap, EvidenceSnapshot):
+            return False, f"invalid_external_snapshot:{slug}:{eid}", None
+        if snap.state == "UNAVAILABLE":
+            return False, f"{snap.reason}:{eid}", None
+        if snap.evidence_id != r["external_id"] or snap.backend not in (slug, "external"):
+            return False, f"external_snapshot_identity_mismatch:{slug}:{eid}", None
+        if snap.state == "UNKNOWN":
+            return False, f"{snap.reason}:{eid}", None
+        if snap.state != "ACTIVE":
+            return False, f"evidence_revoked:{eid}", None
+        if r["require_certified"] and snap.certified is not True:
+            return False, f"evidence_uncertified:{eid}", None
+        try:
+            live_sha = validate_sha256(snap.content_sha256, "live_external_sha256")
+        except ValidationError:
+            return False, f"invalid_external_snapshot_sha256:{slug}:{eid}", None
+        if type(snap.revision) is not int or snap.revision != int(r["bound_revision"]) or live_sha != r["bound_sha256"]:
+            return False, f"evidence_revision_changed:{eid}", live_sha
+        return True, "verified_active_dependencies", live_sha
+
+    def _inspect_live_dep_rows(self, deps: list[sqlite3.Row]) -> tuple[bool, str, list[tuple[str, str]]]:
+        """Verifies all bound dependencies against live files and external providers (batch-capable)."""
+        batched_snaps, batch_errors = self._batch_inspect_external_deps(deps)
 
         verified_pairs: list[tuple[str, str]] = []
         for r in deps:
-            eid = r["evidence_id"]
+            eid = str(r["evidence_id"])
             if r["recorded_state"] != "ACTIVE":
                 return False, f"evidence_revoked:{eid}", []
             if int(r["current_epoch"]) != int(r["bound_epoch"]):
@@ -986,44 +1322,15 @@ class HybridEvidenceGate:
                     return False, f"local_source_drifted:{eid}", []
                 verified_pairs.append((eid, snap.content_sha256))
             elif r["kind"] == "external":
-                prov = r["provider"]
-                if prov in batch_errors:
-                    return False, f"{batch_errors[prov]}:{eid}", []
+                prov = str(r["provider"])
                 try:
                     slug = validate_provider(prov, allow_local=False)
+                    snap = batched_snaps.get((slug, str(r["external_id"])))
                 except ValidationError:
-                    return False, f"corrupted_evidence_provider:{eid}", []
-
-                if (slug, r["external_id"]) in batched_snaps:
-                    snap = batched_snaps[(slug, r["external_id"])]
-                else:
-                    adapter = self._resolve_provider(slug)
-                    try:
-                        snap = adapter.inspect(r["external_id"])
-                    except Exception as exc:
-                        err_prefix = (
-                            f"mories_backend_unavailable:{type(exc).__name__}"
-                            if slug == "mories"
-                            else f"external_backend_unavailable:{slug}:{type(exc).__name__}"
-                        )
-                        return False, f"{err_prefix}:{eid}", []
-
-                if not isinstance(snap, EvidenceSnapshot):
-                    return False, f"invalid_external_snapshot:{slug}:{eid}", []
-                if snap.state == "UNAVAILABLE":
-                    return False, f"{snap.reason}:{eid}", []
-                if snap.evidence_id != r["external_id"] or snap.backend not in (slug, "external"):
-                    return False, f"external_snapshot_identity_mismatch:{slug}:{eid}", []
-                if snap.state != "ACTIVE":
-                    return False, f"evidence_revoked:{eid}", []
-                if r["require_certified"] and snap.certified is not True:
-                    return False, f"evidence_uncertified:{eid}", []
-                try:
-                    live_sha = validate_sha256(snap.content_sha256, "live_external_sha256")
-                except ValidationError:
-                    return False, f"invalid_external_snapshot_sha256:{slug}:{eid}", []
-                if type(snap.revision) is not int or snap.revision != int(r["bound_revision"]) or live_sha != r["bound_sha256"]:
-                    return False, f"evidence_revision_changed:{eid}", []
+                    snap = None
+                ok, reason, live_sha = self._evaluate_external_dep_snapshot(r, snap, batch_errors.get(prov))
+                if not ok or live_sha is None:
+                    return False, reason, []
                 verified_pairs.append((eid, live_sha))
             else:
                 return False, f"unknown_evidence_kind:{r['kind']}:{eid}", []
@@ -1696,27 +2003,62 @@ class HybridEvidenceGate:
             "top_tasks": top_tasks,
         }
 
-    def partition_for_kv_cache(self, task_id: str) -> KVPinnedContextPlan:
-        """Partitions bound dependencies into deterministic ``stable_prefix_ids`` and ``changed_suffix_ids``."""
+    def partition_for_kv_cache(
+        self,
+        task_id: str,
+        *,
+        pin_order: Sequence[str] | None = None,
+    ) -> KVPinnedContextPlan:
+        """Partitions bound dependencies into deterministic ``stable_prefix_ids`` and ``changed_suffix_ids``.
+
+        Orders items by ``(last_mutated_ns ASC, bind_seq ASC, evidence_id ASC)`` (or explicit
+        ``pin_order`` when provided) and inspects external providers with a single batched
+        ``inspect_many`` call per provider.
+        """
         validate_identifier(task_id, "task_id")
+        validated_pin = self._validate_pin_order(pin_order)
         deps = self._fetch_task_dep_rows(task_id)
         if not deps:
             raise ValidationError("task_has_no_bound_dependencies")
 
-        stable: list[str] = []
-        changed: list[str] = []
+        batched_snaps, batch_errors = self._batch_inspect_external_deps(deps)
+        stable_rows: list[sqlite3.Row] = []
+        changed_rows: list[sqlite3.Row] = []
         for r in deps:
-            eid = r["evidence_id"]
-            ok, _, _ = self._inspect_live_dep_rows([r])
-            if ok:
-                stable.append(eid)
+            eid = str(r["evidence_id"])
+            if r["kind"] == "local":
+                ok = False
+                if (
+                    r["recorded_state"] == "ACTIVE"
+                    and int(r["current_epoch"]) == int(r["bound_epoch"])
+                    and r["provider"] == "local"
+                ):
+                    snap = self._local.inspect(eid, r["uri"], int(r["active_revision"]))
+                    ok = (
+                        snap.state == "ACTIVE"
+                        and snap.content_sha256 == r["bound_sha256"]
+                        and snap.revision == int(r["bound_revision"])
+                    )
+            elif r["kind"] == "external":
+                prov = str(r["provider"])
+                try:
+                    slug = validate_provider(prov, allow_local=False)
+                    snap = batched_snaps.get((slug, str(r["external_id"])))
+                except ValidationError:
+                    snap = None
+                ok, _, _ = self._evaluate_external_dep_snapshot(r, snap, batch_errors.get(prov))
             else:
-                changed.append(eid)
+                ok = False
+
+            if ok:
+                stable_rows.append(r)
+            else:
+                changed_rows.append(r)
 
         return KVPinnedContextPlan(
             task_id=task_id,
-            stable_prefix_ids=tuple(sorted(stable)),
-            changed_suffix_ids=tuple(sorted(changed)),
+            stable_prefix_ids=self._order_kv_rows(stable_rows, pin_order=validated_pin),
+            changed_suffix_ids=self._order_kv_rows(changed_rows, pin_order=validated_pin),
         )
 
     def build_kv_pinned_prompt(
@@ -1726,30 +2068,36 @@ class HybridEvidenceGate:
         question: str,
         system_header: str = "Answer strictly using the verified evidence blocks below.",
         external_texts: Mapping[str, str] | None = None,
+        pin_order: Sequence[str] | None = None,
     ) -> KVPinnedContextPlan:
         """Builds a 100% lossless KV-cache-optimized prompt for ``task_id``.
 
-        Places ``system_header`` + unchanged ``stable_prefix_ids`` first in canonical
-        deterministic order (so parallel subagents and follow-up questions hit the same
-        LLM KV prefix cache), followed by 100% full raw text of ``changed_suffix_ids``,
-        and ``<QUESTION>`` at the tail. Uses collision-free tag escalation so raw text
-        containing XML/prompt tags cannot break out of evidence delimiters while keeping
-        every character 100% lossless.
+        Places ``system_header`` + unchanged ``stable_prefix_ids`` first in stable
+        ``(last_mutated_ns ASC, bind_seq ASC, evidence_id ASC)`` order (or explicit
+        ``pin_order`` when supplied) so re-bound mutated items stay at the tail instead of
+        thrashing unchanged prefix items. Followed by 100% full raw text of
+        ``changed_suffix_ids``, and ``<QUESTION>`` at the tail. Uses independent collision-free
+        tag escalation so evidence delimiters depend strictly on evidence payloads (never on
+        ``question``) while ``question`` gets its own isolated safe tag. External providers are
+        inspected via a single batched ``inspect_many`` call per provider, while local files use
+        single-FD ``read_verified_text`` TOCTOU protection.
         """
         validate_identifier(task_id, "task_id")
         if not isinstance(question, str) or not question.strip():
             raise ValidationError("invalid_question")
+        validated_pin = self._validate_pin_order(pin_order)
         deps = self._fetch_task_dep_rows(task_id)
         if not deps:
             raise ValidationError("task_has_no_bound_dependencies")
 
-        stable: list[str] = []
-        changed: list[str] = []
+        batched_snaps, batch_errors = self._batch_inspect_external_deps(deps)
+        stable_rows: list[sqlite3.Row] = []
+        changed_rows: list[sqlite3.Row] = []
         item_bodies: dict[str, tuple[str, str | None, str, str]] = {}
         # value: (provider, raw_body_or_none, escaped_uri, sha_for_pointer)
 
         for r in deps:
-            eid = r["evidence_id"]
+            eid = str(r["evidence_id"])
             if r["kind"] == "local":
                 base_ok = (
                     r["recorded_state"] == "ACTIVE"
@@ -1760,29 +2108,30 @@ class HybridEvidenceGate:
                 try:
                     _, live_sha, raw_txt = self._local.read_verified_text(r["uri"])
                     if base_ok and live_sha == r["bound_sha256"]:
-                        stable.append(eid)
+                        stable_rows.append(r)
                     else:
-                        changed.append(eid)
+                        changed_rows.append(r)
                     item_bodies[eid] = ("local", raw_txt, r["uri"], live_sha)
                 except Exception:
-                    changed.append(eid)
+                    changed_rows.append(r)
                     item_bodies[eid] = ("local", None, r["uri"], "0" * 64)
             else:
-                prov = r["provider"]
-                live_sha_for_ptr = str(r["bound_sha256"])
+                prov = str(r["provider"])
+                live_sha_for_ptr = "0" * 64
                 live_active_sha: str | None = None
-                try:
-                    slug = validate_provider(prov, allow_local=False)
-                    snap = self._resolve_provider(slug).inspect(r["external_id"])
-                    if isinstance(snap, EvidenceSnapshot) and snap.state == "ACTIVE":
-                        live_active_sha = validate_sha256(snap.content_sha256, "live_external_sha256")
-                        live_sha_for_ptr = live_active_sha
-                    elif isinstance(snap, EvidenceSnapshot):
+                snap: EvidenceSnapshot | None = None
+                err = batch_errors.get(prov)
+                if err is None:
+                    try:
+                        slug = validate_provider(prov, allow_local=False)
+                        snap = batched_snaps.get((slug, str(r["external_id"])))
+                        if isinstance(snap, EvidenceSnapshot) and snap.state == "ACTIVE":
+                            live_active_sha = validate_sha256(snap.content_sha256, "live_external_sha256")
+                            live_sha_for_ptr = live_active_sha
+                    except Exception:
                         live_sha_for_ptr = "0" * 64
-                except Exception:
-                    live_sha_for_ptr = "0" * 64
 
-                ok, _, _ = self._inspect_live_dep_rows([r])
+                ok, _, _ = self._evaluate_external_dep_snapshot(r, snap, err)
                 if external_texts is not None and eid in external_texts:
                     ext_body = external_texts[eid]
                     if not isinstance(ext_body, str):
@@ -1797,25 +2146,38 @@ class HybridEvidenceGate:
                     item_bodies[eid] = (prov, None, r["uri"], live_sha_for_ptr)
 
                 if ok:
-                    stable.append(eid)
+                    stable_rows.append(r)
                 else:
-                    changed.append(eid)
+                    changed_rows.append(r)
 
-        stable_ids = tuple(sorted(stable))
-        changed_ids = tuple(sorted(changed))
+        stable_ids = self._order_kv_rows(stable_rows, pin_order=validated_pin)
+        changed_ids = self._order_kv_rows(changed_rows, pin_order=validated_pin)
 
-        # Deterministic collision-free delimiter escalation (preserves 100% raw bytes inside blocks)
-        all_raw_strings = [question, system_header] + [
+        # Deterministic collision-free delimiter escalation:
+        # 1. Compute <CONTEXT>/<EVIDENCE> tags strictly from system_header + evidence payloads
+        #    (NEVER from question) so user questions containing <EVIDENCE> never bust KV prefix.
+        # 2. Compute <QUESTION> tag independently so question content is safely isolated at the tail.
+        evidence_raw_strings = [system_header] + [
             body for (_, body, _, _) in item_bodies.values() if body is not None
         ]
-        esc_idx = 0
+        ev_esc_idx = 0
         while True:
-            sfx = "" if esc_idx == 0 else f"_{esc_idx}"
-            ctx_tag, ev_tag, q_tag = f"CONTEXT{sfx}", f"EVIDENCE{sfx}", f"QUESTION{sfx}"
-            markers = (f"<{ctx_tag}", f"</{ctx_tag}", f"<{ev_tag}", f"</{ev_tag}", f"<{q_tag}", f"</{q_tag}")
-            if not any(m in text for text in all_raw_strings for m in markers):
+            ev_sfx = "" if ev_esc_idx == 0 else f"_{ev_esc_idx}"
+            ctx_tag, ev_tag = f"CONTEXT{ev_sfx}", f"EVIDENCE{ev_sfx}"
+            ev_markers = (f"<{ctx_tag}", f"</{ctx_tag}", f"<{ev_tag}", f"</{ev_tag}")
+            if not any(m in text for text in evidence_raw_strings for m in ev_markers):
                 break
-            esc_idx += 1
+            ev_esc_idx += 1
+
+        q_check_strings = [question] + evidence_raw_strings
+        q_esc_idx = 0
+        while True:
+            q_sfx = "" if q_esc_idx == 0 else f"_{q_esc_idx}"
+            q_tag = f"QUESTION{q_sfx}"
+            q_markers = (f"<{q_tag}", f"</{q_tag}")
+            if not any(m in text for text in q_check_strings for m in q_markers):
+                break
+            q_esc_idx += 1
 
         def _render_one(eid: str) -> str:
             prov, raw_body, uri, ptr_sha = item_bodies[eid]
