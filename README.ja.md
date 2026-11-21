@@ -67,28 +67,28 @@
 
 </details>
 
-### 2. エンジン実行性能・セキュリティ・マルチプロセス並行性指標（`v0.3.1`）
+### 2. エンジン実行性能・セキュリティ・マルチプロセス並行性指標（`v0.4.0`）
 
 | 検証項目 | 実測値 | 検証範囲・条件 |
 |---|---|---|
-| **統合検証スイート** | **内蔵公開 `26 / 26` PASS** + **リリース `32 / 32` PASS** | 公開 `tests/test_synapse_hybrid_gate.py`（`0.35 秒`）+ 隔離 Wheel（`python3 -I -B`） |
+| **統合検証スイート** | **内蔵公開 `32 / 32` PASS** | 公開 `tests/`（`0.44s`, `unittest`/`pytest`）— ロックフリー読取、Fail-Closed `external_texts`、書込ロック外 OCC、ブレーカー・SDK 回帰 |
 | **8 並列サブエージェント Prefix 共有率（`H07`）** | **`95.6%`** プレフィックスバイト完全一致 | 共通仕様書を参照しつつ個別サブタスクを並列実行する 8 サブエージェント間の比較 |
 | **マルチプロセス SQLite WAL 並行性（`H08`）** | **6 OS プロセスでロック・スナップショットエラー `0` 件** | 同時 `read_only=True` MVCC スナップショットワーカー 4 + 同時 Writer 2 および OCC 競合遮断 |
-| **メモリ使用量＆実行時間** | **Peak RSS `48.86 MiB`**（全スイート `6.37 秒`） | 純粋な Python `>=3.11` 標準ライブラリのみ（外部 pip 依存パッケージ `0` 個） |
-| **改ざん検知＆プロンプト脱出防御（`H06`, `H07`）** | **`100%` 遮断（`HOLD` / `DENY`）** | キャッシュ行とハッシュチェーンレシートの二重照合、敵対的 `</EVIDENCE>` タグ自動昇格（`EVIDENCE_1`）、`O_NOFOLLOW` シンボリックリンク拒否、POSIX `0600` 権限 |
+| **ゼロ依存＆省メモリ設計** | **外部ランタイム依存 `0` 個** | 純粋な Python `>=3.11` 標準ライブラリのみ（`dependencies = []`）、`O(1)` RAM ストリーミング `verify_chain()` |
+| **改ざん検知＆プロンプト脱出防御（`H06`, `H07`）** | **`100%` 遮断（`HOLD` / `DENY`）** | キャッシュ行とハッシュチェーンレシートの二重照合、Prefix/Suffix/Question 独立 XML タグ昇格、`O_NOFOLLOW`/`O_NONBLOCK` 保護、POSIX `0600` 権限 |
 
 ---
 
 ## 5 分クイックスタート
 
 ```bash
-pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.1
+pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.4.0
 # またはローカルクローン後、API キー不要のデモを即座に実行：
 pip install .
 python3 examples/demo_lossless_savings.py
 ```
 
-### 1. 単体利用での無損失 LLM キャッシュ・KV-Prefix 固定・トークン監視
+### 1. 単体利用での無損失 LLM キャッシュ＆ロックフリー KV-Prefix 固定
 
 ```python
 from synapse_hybrid_gate import HybridEvidenceGate
@@ -110,7 +110,7 @@ with HybridEvidenceGate("gate.db", project_root=".") as gate:
         plan.rendered_prompt,
         lambda prompt: ('{"safe": true}', 1800, 120),  # 実際の LLM API 呼び出しに置換
     )
-    print(outcome.cache_hit, gate.token_monitoring_report())
+    print(outcome.cache_hit, outcome.saved_input_tokens, outcome.saved_output_tokens)
 ```
 
 ### 2. `Mem0`、`Zep/Graphiti`、`PostgreSQL`、`Mories` との接続（ロックインゼロ）
@@ -151,7 +151,7 @@ with HybridEvidenceGate("gate.db", project_root=".") as gate:
 
 ---
 
-## CLI リファレンス＆トークン削減量リアルタイム監視（`monitor`）
+## CLI リファレンス
 
 終了コード（Exit Code）：`0`（`ALLOW` / 正常）、`2`（`HOLD` — ファイル変更・メモリ失効・外部アダプタオフライン）、`3`（`ERROR` / `DENY` / ハッシュチェーン改ざん / CLI 引数エラー）。
 
@@ -167,11 +167,8 @@ synapse-hybrid-gate --db gate.db --project-root . cache-store --task-id task:t1 
 synapse-hybrid-gate --db gate.db --project-root . cache-lookup --task-id task:t1 --prompt-sha256 <SHA256>
 synapse-hybrid-gate --db gate.db --read-only check-task --task-id task:t1
 
-# 回避した LLM 呼出回数、節約した入出力トークン数、キャッシュヒット率(%)、KV-Prefix 固定トークン数を表示：
-synapse-hybrid-gate --db gate.db monitor --format table
-synapse-hybrid-gate --db gate.db monitor --format json
-
-# オンライン安全な SQLite バックアップ（0600 権限・シンボリックリンク拒否）＆ハッシュチェーン検証：
+# 台帳ステータス確認、オンライン安全な SQLite バックアップ（0600 権限・シンボリックリンク拒否）＆ストリーミングハッシュチェーン検証：
+synapse-hybrid-gate --db gate.db status
 synapse-hybrid-gate --db gate.db backup --dest gate.backup.db
 synapse-hybrid-gate --db gate.db verify-chain
 ```
@@ -188,6 +185,6 @@ python3 examples/demo_lossless_savings.py
 ## 企業セキュリティとアーキテクチャ境界
 
 - **通信傍受ゼロ（Zero-Proxy / Zero-Daemon）**：ローカル HTTP/HTTPS プロキシの起動、API キーや TLS 通信の傍受、ネットワークポートの待受を一切行いません。企業の厳格なセキュリティ（DLP/EDR）ポリシーに準拠し、Claude Code、Codex、OpenCode、Cursor、自社製 Python エージェントへプロジェクト単位（Opt-in）で安全に導入できます。
-- **ファイルシステム＆台帳の堅牢化**：`project_root` 境界強制、中間シンボリックリンク拒否（`lstat` + `O_NOFOLLOW`）、通常ファイル検証、巨大ファイル DoS 上限（`max_file_bytes`、既定 `64 MiB`）、POSIX `0600` 所有者限定 DB 権限、SHA-256 ハッシュチェーンレシートを徹底しています。
-- **明示的スキーマ移行**：旧バージョン（`v1`/`v2`）の SQLite 台帳を開くと `SchemaVersionError` で安全に停止し、`migrate_database(db_path)` または `synapse-hybrid-gate --db gate.db migrate` による明示的なアップグレードを要求します。
+- **ファイルシステム＆台帳の堅牢化**：`project_root` 境界強制、中間シンボリックリンク拒否（`lstat` + `O_NOFOLLOW` + `O_NONBLOCK`）、通常ファイル検証、巨大ファイル DoS 上限（`max_file_bytes`、既定 `64 MiB`）、POSIX `0600` 所有者限定 DB 権限、ロックフリー MVCC 読取経路、SHA-256 ハッシュチェーンレシートを徹底しています。
+- **厳格なスキーマ分離（`v4`）**：互換性のない旧バージョン（`v4` 未満）の SQLite 台帳を開くと、自動改変せず `SchemaVersionError` で安全に停止します。
 - 本プロジェクトは **Apache License, Version 2.0**（[LICENSE](./LICENSE)）のもとで公開されています。

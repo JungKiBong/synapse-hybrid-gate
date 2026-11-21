@@ -1,4 +1,4 @@
-"""SQLite WAL zero-copy dependency, hash-chained receipt, lossless token-cache,
+"""SQLite WAL zero-copy dependency, hash-chained receipt, lossless outcome cache,
 and parallel optimistic-concurrency gate with Universal Memory Port.
 """
 from __future__ import annotations
@@ -22,15 +22,12 @@ from .adapters import (
     EvidenceSnapshot,
     ExternalMemoryPort,
     LocalFileEvidenceAdapter,
-    MoriesEvidenceAdapter,
     OfflineExternalAdapter,
-    OfflineMoriesAdapter,
     validate_identifier,
     validate_provider,
     validate_sha256,
 )
 from .context_cache import CachedStepOutcome, KVPinnedContextPlan, WorkLease
-from .core_hook import NormativeGatePort
 from .exceptions import (
     EvidenceConflictError,
     PathSecurityError,
@@ -41,16 +38,14 @@ from .exceptions import (
 )
 
 
-SCHEMA_VERSION = "synapse-hybrid-gate-sqlite-v3"
-LEGACY_SCHEMA_V1 = "synapse-hybrid-gate-sqlite-v1"
-LEGACY_SCHEMA_V2 = "synapse-hybrid-gate-sqlite-v2"
+SCHEMA_VERSION = "synapse-hybrid-gate-sqlite-v4"
 GENESIS_CHAIN_HASH = "0" * 64
 DEFAULT_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024  # 4 MiB cached payload ceiling
 
 
 @dataclass(frozen=True, slots=True)
 class GateCheckResult:
-    """Deterministic gate evaluation verdict for a bound task or fast-path key."""
+    """Deterministic gate evaluation verdict for a bound task."""
 
     task_id: str
     decision: str  # 'ALLOW' | 'HOLD' | 'DENY'
@@ -113,185 +108,9 @@ def _apply_owner_only_permissions(path: Path) -> None:
             pass
 
 
-def _ensure_kv_order_columns(conn: sqlite3.Connection) -> bool:
-    """Idempotently adds KV-prefix stable ordering columns on existing SQLite schemas."""
-    changed = False
-    ev_cols = {
-        r["name"]
-        for r in conn.execute("PRAGMA table_info(evidence_sources)").fetchall()
-    }
-    if ev_cols and "last_mutated_ns" not in ev_cols:
-        conn.execute(
-            "ALTER TABLE evidence_sources ADD COLUMN last_mutated_ns INTEGER NOT NULL DEFAULT 0"
-        )
-        changed = True
-
-    dep_cols = {
-        r["name"]
-        for r in conn.execute("PRAGMA table_info(task_dependencies)").fetchall()
-    }
-    if dep_cols:
-        if "bind_seq" not in dep_cols:
-            conn.execute(
-                "ALTER TABLE task_dependencies ADD COLUMN bind_seq INTEGER NOT NULL DEFAULT 0"
-            )
-            changed = True
-        if "last_mutated_ns" not in dep_cols:
-            conn.execute(
-                "ALTER TABLE task_dependencies ADD COLUMN last_mutated_ns INTEGER NOT NULL DEFAULT 0"
-            )
-            changed = True
-    return changed
-
-
-def migrate_database(db_path: str | Path, *, secure_permissions: bool = True) -> dict[str, Any]:
-    """Atomically upgrades a ``v1`` (0.1.0) or ``v2`` (0.2.0) SQLite database to ``v3`` (0.3.0).
-
-    Args:
-        db_path: Path to an existing SQLite gate database.
-        secure_permissions: If True, tightens file mode to ``0600`` on POSIX.
-
-    Returns:
-        Dictionary summarizing ``migrated_from``, ``migrated_to``, and ``changed``.
-
-    Raises:
-        SchemaVersionError: If the database is missing ``gate_meta`` or has an unknown schema.
-    """
-    target = Path(db_path)
-    if not target.is_file():
-        raise SchemaVersionError("database_file_not_found")
-    if stat.S_ISLNK(os.lstat(str(target)).st_mode):
-        raise PathSecurityError("database_symlink_rejected")
-    conn = sqlite3.connect(str(target), isolation_level=None, timeout=10.0)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            tables = {
-                r["name"]
-                for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            }
-            if "gate_meta" not in tables:
-                raise SchemaVersionError("corrupted_gate_meta")
-            meta = {
-                r["key"]: r["value"]
-                for r in conn.execute("SELECT key, value FROM gate_meta").fetchall()
-            }
-            if "project_root" not in meta or "head_seq" not in meta or "head_chain_sha256" not in meta:
-                raise SchemaVersionError("corrupted_gate_meta")
-            current = meta.get("schema")
-            if current == SCHEMA_VERSION:
-                patched = _ensure_kv_order_columns(conn)
-                conn.execute("COMMIT")
-                return {"migrated_from": SCHEMA_VERSION, "migrated_to": SCHEMA_VERSION, "changed": patched}
-            if current not in (LEGACY_SCHEMA_V1, LEGACY_SCHEMA_V2):
-                raise SchemaVersionError("incompatible_schema_version")
-
-            if current == LEGACY_SCHEMA_V1:
-                conn.execute(
-                    """
-                    CREATE TABLE evidence_sources_v3 (
-                        evidence_id TEXT PRIMARY KEY,
-                        kind TEXT NOT NULL CHECK(kind IN ('local', 'external')),
-                        provider TEXT NOT NULL,
-                        uri TEXT NOT NULL,
-                        external_id TEXT NOT NULL,
-                        epoch INTEGER NOT NULL CHECK(epoch >= 1),
-                        active_revision INTEGER NOT NULL CHECK(active_revision >= 1),
-                        content_sha256 TEXT NOT NULL,
-                        state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'REVOKED')),
-                        certified INTEGER NOT NULL CHECK(certified IN (0, 1)),
-                        require_certified INTEGER NOT NULL CHECK(require_certified IN (0, 1)),
-                        updated_ns INTEGER NOT NULL,
-                        last_mutated_ns INTEGER NOT NULL DEFAULT 0,
-                        CHECK((kind = 'local' AND provider = 'local') OR (kind = 'external' AND provider <> 'local'))
-                    )
-                    """
-                )
-                conn.execute(
-                    """
-                    INSERT INTO evidence_sources_v3(
-                        evidence_id, kind, provider, uri, external_id, epoch, active_revision,
-                        content_sha256, state, certified, require_certified, updated_ns, last_mutated_ns
-                    )
-                    SELECT
-                        evidence_id,
-                        CASE WHEN backend = 'local' THEN 'local' ELSE 'external' END,
-                        backend,
-                        uri,
-                        external_id,
-                        epoch,
-                        active_revision,
-                        content_sha256,
-                        state,
-                        certified,
-                        require_certified,
-                        updated_ns,
-                        0
-                    FROM evidence_sources
-                    """
-                )
-                conn.execute("DROP TABLE evidence_sources")
-                conn.execute("ALTER TABLE evidence_sources_v3 RENAME TO evidence_sources")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_evidence_provider ON evidence_sources(provider)")
-
-            _ensure_kv_order_columns(conn)
-
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS verified_outcome_cache (
-                    task_id TEXT NOT NULL REFERENCES task_specs(task_id) ON DELETE CASCADE,
-                    prompt_sha256 TEXT NOT NULL,
-                    receipt_id TEXT NOT NULL REFERENCES audit_receipts(receipt_id),
-                    dependency_digest TEXT NOT NULL,
-                    outcome_sha256 TEXT NOT NULL,
-                    payload_text TEXT NOT NULL,
-                    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
-                    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
-                    hit_count INTEGER NOT NULL DEFAULT 0 CHECK(hit_count >= 0),
-                    created_ns INTEGER NOT NULL,
-                    PRIMARY KEY (task_id, prompt_sha256)
-                )
-                """
-            )
-            for k in (
-                "avoided_calls",
-                "saved_input_tokens",
-                "saved_output_tokens",
-                "executed_calls",
-                "executed_input_tokens",
-                "executed_output_tokens",
-                "kv_prompts_built",
-                "kv_prefix_chars_total",
-                "kv_prompt_chars_total",
-            ):
-                conn.execute("INSERT OR IGNORE INTO gate_meta(key, value) VALUES (?, '0')", (k,))
-            conn.execute("UPDATE gate_meta SET value = ? WHERE key = 'schema'", (SCHEMA_VERSION,))
-            fk_violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-            if fk_violations:
-                raise SchemaVersionError("migration_foreign_key_violation")
-            conn.execute("COMMIT")
-            conn.execute("PRAGMA foreign_keys=ON")
-        except Exception:
-            if conn.in_transaction:
-                try:
-                    conn.execute("ROLLBACK")
-                except sqlite3.Error:
-                    pass
-            raise
-    finally:
-        conn.close()
-
-    if secure_permissions:
-        _apply_owner_only_permissions(target)
-    return {"migrated_from": current, "migrated_to": SCHEMA_VERSION, "changed": True}
-
-
 class HybridEvidenceGate:
-    """Vendor-neutral SQLite WAL evidence dependency gate with lossless token-saving cache,
-    KV-prefix pinning, multi-process concurrency support, and optional normative hooks.
+    """Vendor-neutral SQLite WAL evidence dependency gate with lossless outcome cache,
+    KV-prefix pinning, and multi-process optimistic concurrency.
     """
 
     def __init__(
@@ -300,8 +119,6 @@ class HybridEvidenceGate:
         *,
         project_root: str | Path | None = None,
         providers: Mapping[str, ExternalMemoryPort] | None = None,
-        mories_adapter: MoriesEvidenceAdapter | None = None,
-        normative_gate: NormativeGatePort | None = None,
         read_only: bool = False,
         busy_timeout_ms: int = 10_000,
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
@@ -335,15 +152,8 @@ class HybridEvidenceGate:
                 if adapter is None or not callable(getattr(adapter, "inspect", None)):
                     raise TypeError(f"invalid_provider_adapter:{slug}")
                 resolved_providers[slug] = adapter
-        if mories_adapter is not None:
-            if "mories" in resolved_providers and resolved_providers["mories"] is not mories_adapter:
-                raise ValidationError("duplicate_mories_provider_configuration")
-            if not callable(getattr(mories_adapter, "inspect", None)):
-                raise TypeError("invalid_provider_adapter:mories")
-            resolved_providers["mories"] = mories_adapter
 
         self._providers = resolved_providers
-        self._normative = normative_gate
 
         timeout_sec = max(0.1, busy_timeout_ms / 1000.0)
         if read_only:
@@ -407,9 +217,7 @@ class HybridEvidenceGate:
     def _resolve_provider(self, provider: str) -> ExternalMemoryPort:
         slug = validate_provider(provider, allow_local=False)
         adapter = self._providers.get(slug)
-        if adapter is not None:
-            return adapter
-        return OfflineMoriesAdapter() if slug == "mories" else OfflineExternalAdapter(slug)
+        return adapter if adapter is not None else OfflineExternalAdapter(slug)
 
     def _bind_verified_root(
         self,
@@ -442,16 +250,6 @@ class HybridEvidenceGate:
         except sqlite3.Error as exc:
             raise SchemaVersionError("corrupted_gate_meta") from exc
         effective_raw_root = self._bind_verified_root(meta, supplied_root, raw_project_root)
-        dep_cols = {
-            r["name"]
-            for r in self._conn.execute("PRAGMA table_info(task_dependencies)").fetchall()
-        }
-        ev_cols = {
-            r["name"]
-            for r in self._conn.execute("PRAGMA table_info(evidence_sources)").fetchall()
-        }
-        self._has_dep_order_cols = "bind_seq" in dep_cols and "last_mutated_ns" in dep_cols
-        self._has_ev_mutated_col = "last_mutated_ns" in ev_cols
         self._local = LocalFileEvidenceAdapter(effective_raw_root, max_file_bytes=self._max_file_bytes)
 
     def _init_schema(self, supplied_root: Path | None, *, raw_project_root: Path | None) -> None:
@@ -517,15 +315,6 @@ class HybridEvidenceGate:
             """,
             "CREATE INDEX IF NOT EXISTS idx_receipts_task_seq ON audit_receipts(task_id, seq DESC)",
             """
-            CREATE TABLE IF NOT EXISTS fast_file_cache (
-                cache_key TEXT PRIMARY KEY,
-                file_uri TEXT NOT NULL,
-                file_sha256 TEXT NOT NULL,
-                outcome_sha256 TEXT NOT NULL,
-                updated_ns INTEGER NOT NULL
-            )
-            """,
-            """
             CREATE TABLE IF NOT EXISTS verified_outcome_cache (
                 task_id TEXT NOT NULL REFERENCES task_specs(task_id) ON DELETE CASCADE,
                 prompt_sha256 TEXT NOT NULL,
@@ -535,22 +324,10 @@ class HybridEvidenceGate:
                 payload_text TEXT NOT NULL,
                 input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
                 output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
-                hit_count INTEGER NOT NULL DEFAULT 0 CHECK(hit_count >= 0),
                 created_ns INTEGER NOT NULL,
                 PRIMARY KEY (task_id, prompt_sha256)
             )
             """,
-        )
-        counter_keys = (
-            "avoided_calls",
-            "saved_input_tokens",
-            "saved_output_tokens",
-            "executed_calls",
-            "executed_input_tokens",
-            "executed_output_tokens",
-            "kv_prompts_built",
-            "kv_prefix_chars_total",
-            "kv_prompt_chars_total",
         )
         with self._tx():
             meta_exists = self._conn.execute(
@@ -566,15 +343,7 @@ class HybridEvidenceGate:
 
             for stmt in ddl_statements:
                 self._conn.execute(stmt)
-            voc_cols = {
-                r["name"]
-                for r in self._conn.execute("PRAGMA table_info(verified_outcome_cache)").fetchall()
-            }
-            if "hit_count" not in voc_cols:
-                self._conn.execute(
-                    "ALTER TABLE verified_outcome_cache ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0"
-                )
-            _ensure_kv_order_columns(self._conn)
+
             meta = {
                 r["key"]: r["value"]
                 for r in self._conn.execute("SELECT key, value FROM gate_meta").fetchall()
@@ -591,16 +360,10 @@ class HybridEvidenceGate:
                     """,
                     (SCHEMA_VERSION, encoded_root, GENESIS_CHAIN_HASH),
                 )
-                for k in counter_keys:
-                    self._conn.execute("INSERT INTO gate_meta(key, value) VALUES (?, '0')", (k,))
                 effective_raw_root = raw_project_root
             else:
                 effective_raw_root = self._bind_verified_root(meta, supplied_root, raw_project_root)
-                for k in counter_keys:
-                    self._conn.execute("INSERT OR IGNORE INTO gate_meta(key, value) VALUES (?, '0')", (k,))
 
-        self._has_dep_order_cols = True
-        self._has_ev_mutated_col = True
         self._local = LocalFileEvidenceAdapter(effective_raw_root, max_file_bytes=self._max_file_bytes)
 
     class _TxContext:
@@ -671,19 +434,7 @@ class HybridEvidenceGate:
         return max(now_ns, max_ns + 1)
 
     def register_local_evidence(self, evidence_id: str, file_path: str | Path) -> EvidenceSnapshot:
-        """Registers or updates a regular local file evidence pointer.
-
-        Args:
-            evidence_id: Unique logical identifier for this evidence item.
-            file_path: Path to a regular file (within ``project_root`` if bounded).
-
-        Returns:
-            ``EvidenceSnapshot`` containing the active revision and SHA-256 digest.
-
-        Raises:
-            PathSecurityError: On symlink, traversal, root escape, non-regular file, or size limit breach.
-            EvidenceConflictError: If ``evidence_id`` was previously registered to an external provider.
-        """
+        """Registers or updates a regular local file evidence pointer."""
         self._require_writable()
         validate_identifier(evidence_id, "evidence_id")
         stored_uri, digest = self._local.resolve_and_hash(file_path)
@@ -753,21 +504,7 @@ class HybridEvidenceGate:
         provider: str = "external",
         require_certified: bool = True,
     ) -> EvidenceSnapshot:
-        """Registers or refreshes an external memory item pointer from ``provider``.
-
-        Args:
-            evidence_id: Unique logical identifier in the gate database.
-            item_id: Upstream item identifier in the external memory store.
-            provider: Lowercase provider slug (e.g. ``'mem0'``, ``'zep'``, ``'postgres'``, ``'mories'``).
-            require_certified: Whether ``check_task`` requires ``certified=True`` on live inspection.
-
-        Returns:
-            Normalized ``EvidenceSnapshot`` recorded in SQLite.
-
-        Raises:
-            ValidationError: On malformed IDs, reserved ``provider='local'``, or invalid snapshot fields.
-            EvidenceConflictError: If inactive/unavailable upstream or conflicting with an existing provider.
-        """
+        """Registers or refreshes an external memory item pointer from ``provider``."""
         self._require_writable()
         validate_identifier(evidence_id, "evidence_id")
         validate_identifier(item_id, "external_item_id")
@@ -895,38 +632,6 @@ class HybridEvidenceGate:
             require_certified=bool(row["require_certified"]),
         )
 
-    def register_mories_evidence(
-        self,
-        evidence_id: str,
-        mories_item_id: str,
-        *,
-        require_certified: bool = True,
-    ) -> EvidenceSnapshot:
-        """Backward-compatible helper delegating to ``register_external_evidence(..., provider='mories')``."""
-        return self.register_external_evidence(
-            evidence_id,
-            mories_item_id,
-            provider="mories",
-            require_certified=require_certified,
-        )
-
-    def refresh_mories_evidence(self, evidence_id: str) -> EvidenceSnapshot:
-        """Backward-compatible helper refreshing a ``provider='mories'`` evidence item."""
-        self._require_writable()
-        validate_identifier(evidence_id, "evidence_id")
-        row = self._conn.execute(
-            "SELECT kind, provider, external_id, require_certified FROM evidence_sources WHERE evidence_id = ?",
-            (evidence_id,),
-        ).fetchone()
-        if row is None or row["kind"] != "external" or row["provider"] != "mories":
-            raise ValidationError("unknown_mories_evidence")
-        return self.register_external_evidence(
-            evidence_id,
-            row["external_id"],
-            provider="mories",
-            require_certified=bool(row["require_certified"]),
-        )
-
     def revoke_evidence(self, evidence_id: str) -> list[str]:
         """Marks ``evidence_id`` as ``REVOKED``, increments its monotonic ``epoch``, and returns affected tasks."""
         self._require_writable()
@@ -1035,13 +740,7 @@ class HybridEvidenceGate:
         *,
         pin_order: Sequence[str] | None = None,
     ) -> str:
-        """Binds ``task_id`` to the current active ``(epoch, revision, sha256)`` of ``evidence_ids``.
-
-        Preserves deterministic KV-prefix ordering metadata (``bind_seq``, ``last_mutated_ns``)
-        so unchanged dependencies keep their existing prefix positions while mutated or newly
-        added dependencies advance monotonically to the tail. Pass ``pin_order`` to explicitly
-        pin specific evidence IDs in a caller-chosen order.
-        """
+        """Binds ``task_id`` to the current active ``(epoch, revision, sha256)`` of ``evidence_ids``."""
         self._require_writable()
         validate_identifier(task_id, "task_id")
         ev_list = sorted({validate_identifier(eid, "evidence_id") for eid in evidence_ids})
@@ -1179,15 +878,10 @@ class HybridEvidenceGate:
         return _compute_dependency_digest(digest_rows)
 
     def _fetch_task_dep_rows(self, task_id: str) -> list[sqlite3.Row]:
-        order_cols = (
-            "d.bind_seq, d.last_mutated_ns"
-            if self._has_dep_order_cols
-            else "0 AS bind_seq, 0 AS last_mutated_ns"
-        )
         return self._conn.execute(
-            f"""
+            """
             SELECT d.evidence_id, d.bound_epoch, d.bound_revision, d.bound_sha256,
-                   {order_cols},
+                   d.bind_seq, d.last_mutated_ns,
                    e.kind, e.provider, e.uri, e.external_id, e.epoch AS current_epoch, e.active_revision,
                    e.state AS recorded_state, e.require_certified
             FROM task_dependencies d
@@ -1232,21 +926,12 @@ class HybridEvidenceGate:
                     for xid, snap in many.items():
                         batched_snaps[(slug, str(xid))] = snap
                 except Exception as exc:
-                    batch_errors[prov] = (
-                        f"mories_backend_unavailable:{type(exc).__name__}"
-                        if slug == "mories"
-                        else f"external_backend_unavailable:{slug}:{type(exc).__name__}"
-                    )
+                    batch_errors[prov] = f"external_backend_unavailable:{slug}:{type(exc).__name__}"
             else:
                 for xid in ext_ids:
                     try:
                         batched_snaps[(slug, xid)] = adapter.inspect(xid)
                     except Exception as exc:
-                        err_prefix = (
-                            f"mories_backend_unavailable:{type(exc).__name__}"
-                            if slug == "mories"
-                            else f"external_backend_unavailable:{slug}:{type(exc).__name__}"
-                        )
                         batched_snaps[(slug, xid)] = EvidenceSnapshot(
                             evidence_id=xid,
                             backend=slug,
@@ -1255,7 +940,7 @@ class HybridEvidenceGate:
                             content_sha256="0" * 64,
                             state="UNAVAILABLE",
                             certified=False,
-                            reason=err_prefix,
+                            reason=f"external_backend_unavailable:{slug}:{type(exc).__name__}",
                         )
         return batched_snaps, batch_errors
 
@@ -1279,8 +964,7 @@ class HybridEvidenceGate:
             return False, f"corrupted_evidence_provider:{eid}", None
 
         if snap is None:
-            not_found = "mories_item_not_found" if slug == "mories" else f"external_item_not_found:{slug}"
-            return False, f"{not_found}:{eid}", None
+            return False, f"external_item_not_found:{slug}:{eid}", None
         if not isinstance(snap, EvidenceSnapshot):
             return False, f"invalid_external_snapshot:{slug}:{eid}", None
         if snap.state == "UNAVAILABLE":
@@ -1338,14 +1022,10 @@ class HybridEvidenceGate:
         return True, "verified_active_dependencies", verified_pairs
 
     def begin_work(self, task_id: str) -> WorkLease:
-        """Acquires an optimistic-concurrency ``WorkLease`` verifying live dependencies before parallel work.
-
-        Pass ``lease.dependency_digest`` as ``expected_dependency_digest`` when calling
-        ``record_receipt`` or ``store_verified_outcome`` so in-flight mutations by other
-        sessions or parallel subagents are deterministically rejected.
-        """
+        """Acquires an optimistic-concurrency ``WorkLease`` verifying live dependencies before parallel work."""
         validate_identifier(task_id, "task_id")
-        deps = self._fetch_task_dep_rows(task_id)
+        with self._read_snapshot():
+            deps = self._fetch_task_dep_rows(task_id)
         if not deps:
             raise ValidationError("task_has_no_bound_dependencies")
         ok, reason, pairs = self._inspect_live_dep_rows(deps)
@@ -1360,6 +1040,21 @@ class HybridEvidenceGate:
             evidence_digests=tuple(pairs),
             issued_ns=time.time_ns(),
         )
+
+    def _preflight_live_occ_outside_tx(self, task_id: str, expected_dependency_digest: str) -> None:
+        """Runs live external RPCs & local file hashing OUTSIDE SQLite's ``BEGIN IMMEDIATE`` write lock."""
+        with self._read_snapshot():
+            deps = self._fetch_task_dep_rows(task_id)
+        if not deps:
+            raise ValidationError("task_has_no_bound_dependencies")
+        dep_digest = _compute_dependency_digest(
+            [(r["evidence_id"], int(r["bound_epoch"]), int(r["bound_revision"]), r["bound_sha256"]) for r in deps]
+        )
+        if dep_digest != expected_dependency_digest:
+            raise StaleWorkConflictError("stale_work_conflict_bound_digest_changed")
+        ok, live_reason, _ = self._inspect_live_dep_rows(deps)
+        if not ok:
+            raise StaleWorkConflictError(f"stale_work_conflict_live_drift:{live_reason}")
 
     def _append_receipt_in_tx(
         self,
@@ -1376,12 +1071,8 @@ class HybridEvidenceGate:
         dep_digest = _compute_dependency_digest(
             [(r["evidence_id"], int(r["bound_epoch"]), int(r["bound_revision"]), r["bound_sha256"]) for r in deps]
         )
-        if expected_dependency_digest is not None:
-            if dep_digest != expected_dependency_digest:
-                raise StaleWorkConflictError("stale_work_conflict_bound_digest_changed")
-            ok, live_reason, _ = self._inspect_live_dep_rows(deps)
-            if not ok:
-                raise StaleWorkConflictError(f"stale_work_conflict_live_drift:{live_reason}")
+        if expected_dependency_digest is not None and dep_digest != expected_dependency_digest:
+            raise StaleWorkConflictError("stale_work_conflict_bound_digest_changed")
 
         head_meta = {
             r["key"]: r["value"]
@@ -1445,16 +1136,7 @@ class HybridEvidenceGate:
         reason: str = "verified_outcome",
         expected_dependency_digest: str | None = None,
     ) -> dict[str, Any]:
-        """Appends a hash-chained audit receipt for ``task_id``.
-
-        Args:
-            task_id: Bound task identifier.
-            outcome_sha256: 64-hex SHA-256 of the task's verified output.
-            decision: ``'ALLOW'``, ``'HOLD'``, or ``'DENY'``.
-            reason: Non-empty audit reason label.
-            expected_dependency_digest: Optional lease digest from ``begin_work(task_id)``
-                enforcing in-flight optimistic concurrency against parallel edits.
-        """
+        """Appends a hash-chained audit receipt for ``task_id``."""
         self._require_writable()
         validate_identifier(task_id, "task_id")
         outcome_sha256 = validate_sha256(outcome_sha256, "outcome_sha256")
@@ -1467,6 +1149,8 @@ class HybridEvidenceGate:
         if not isinstance(reason, str) or not reason or "\x00" in reason:
             raise ValidationError("invalid_receipt_reason")
 
+        if expected_dependency_digest is not None:
+            self._preflight_live_occ_outside_tx(task_id, expected_dependency_digest)
         with self._tx():
             return self._append_receipt_in_tx(
                 task_id,
@@ -1501,6 +1185,19 @@ class HybridEvidenceGate:
         ).fetchone()
         if head_row is None or head_row["chain_sha256"] != head_hash:
             return False
+        head_recomputed = _compute_chain_hash(
+            str(head_row["prev_chain_sha256"]),
+            int(head_row["seq"]),
+            str(head_row["receipt_id"]),
+            str(head_row["task_id"]),
+            str(head_row["decision"]),
+            str(head_row["reason"]),
+            str(head_row["dependency_digest"]),
+            str(head_row["outcome_sha256"]),
+            int(head_row["created_ns"]),
+        )
+        if head_recomputed != head_hash:
+            return False
 
         seq = int(row["seq"])
         if seq < 1 or seq > head_seq:
@@ -1532,18 +1229,8 @@ class HybridEvidenceGate:
         )
         return recomputed == row["chain_sha256"]
 
-    def check_task(
-        self,
-        task_id: str,
-        *,
-        action: int | None = None,
-        normative_context: Any = None,
-    ) -> GateCheckResult:
-        """Evaluates whether ``task_id``'s latest verified receipt remains safe to reuse (``ALLOW``).
-
-        Performs O(1) receipt row + head hash-chain verification, live local file SHA-256
-        checks, live external provider inspection, and optional normative action gating.
-        """
+    def check_task(self, task_id: str) -> GateCheckResult:
+        """Evaluates whether ``task_id``'s latest verified receipt remains safe to reuse (``ALLOW``)."""
         validate_identifier(task_id, "task_id")
         with self._read_snapshot():
             latest = self._conn.execute(
@@ -1598,38 +1285,6 @@ class HybridEvidenceGate:
                 checked_dependencies=len(deps),
             )
 
-        if self._normative is not None or action is not None or normative_context is not None:
-            if self._normative is None or action is None or normative_context is None:
-                return GateCheckResult(
-                    task_id,
-                    "HOLD",
-                    "normative_gate_incomplete_configuration",
-                    receipt_id=latest["receipt_id"],
-                    outcome_sha256=None,
-                    checked_dependencies=len(deps),
-                )
-            try:
-                verdict = self._normative.evaluate(action, normative_context)
-            except Exception as exc:
-                return GateCheckResult(
-                    task_id,
-                    "HOLD",
-                    f"normative_gate_error:{type(exc).__name__}",
-                    receipt_id=latest["receipt_id"],
-                    outcome_sha256=None,
-                    checked_dependencies=len(deps),
-                )
-            v_decision = verdict.decision if verdict.decision in ("ALLOW", "HOLD", "DENY") else "HOLD"
-            if v_decision != "ALLOW":
-                return GateCheckResult(
-                    task_id,
-                    v_decision,
-                    verdict.reason,
-                    receipt_id=latest["receipt_id"],
-                    outcome_sha256=None,
-                    checked_dependencies=len(deps),
-                )
-
         return GateCheckResult(
             task_id,
             "ALLOW",
@@ -1640,7 +1295,7 @@ class HybridEvidenceGate:
         )
 
     # ------------------------------------------------------------------
-    # PoC-Validated Lossless Outcome Cache & KV-Prefix Context Pinning
+    # Lossless Outcome Cache & KV-Prefix Context Pinning (Lock-Free Reads)
     # ------------------------------------------------------------------
     def store_verified_outcome(
         self,
@@ -1671,6 +1326,8 @@ class HybridEvidenceGate:
             )
 
         out_sha = hashlib.sha256(raw_bytes).hexdigest()
+        if expected_dependency_digest is not None:
+            self._preflight_live_occ_outside_tx(task_id, expected_dependency_digest)
         with self._tx():
             rcpt = self._append_receipt_in_tx(
                 task_id,
@@ -1683,8 +1340,8 @@ class HybridEvidenceGate:
                 """
                 INSERT INTO verified_outcome_cache(
                     task_id, prompt_sha256, receipt_id, dependency_digest,
-                    outcome_sha256, payload_text, input_tokens, output_tokens, hit_count, created_ns
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                    outcome_sha256, payload_text, input_tokens, output_tokens, created_ns
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id, prompt_sha256) DO UPDATE SET
                     receipt_id = excluded.receipt_id,
                     dependency_digest = excluded.dependency_digest,
@@ -1692,7 +1349,6 @@ class HybridEvidenceGate:
                     payload_text = excluded.payload_text,
                     input_tokens = excluded.input_tokens,
                     output_tokens = excluded.output_tokens,
-                    hit_count = 0,
                     created_ns = excluded.created_ns
                 """,
                 (
@@ -1707,32 +1363,17 @@ class HybridEvidenceGate:
                     time.time_ns(),
                 ),
             )
-            self._conn.execute(
-                "UPDATE gate_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'executed_calls'"
-            )
-            self._conn.execute(
-                "UPDATE gate_meta SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT) WHERE key = 'executed_input_tokens'",
-                (input_tokens,),
-            )
-            self._conn.execute(
-                "UPDATE gate_meta SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT) WHERE key = 'executed_output_tokens'",
-                (output_tokens,),
-            )
         return rcpt
 
     def lookup_verified_outcome(
         self,
         task_id: str,
         prompt_sha256: str,
-        *,
-        record_savings: bool = True,
-        action: int | None = None,
-        normative_context: Any = None,
     ) -> CachedStepOutcome:
-        """Returns a lossless cached LLM output ONLY when ``check_task == ALLOW`` and all chained digests match."""
+        """Lock-free read returning a lossless cached LLM output ONLY when ``check_task == ALLOW``."""
         validate_identifier(task_id, "task_id")
         p_sha = validate_sha256(prompt_sha256, "prompt_sha256")
-        chk = self.check_task(task_id, action=action, normative_context=normative_context)
+        chk = self.check_task(task_id)
         if chk.decision != "ALLOW":
             return CachedStepOutcome(task_id, False, chk.decision, chk.reason)
 
@@ -1774,26 +1415,6 @@ class HybridEvidenceGate:
         ):
             return CachedStepOutcome(task_id, False, "HOLD", "outcome_cache_stale_or_corrupted")
 
-        in_tok = int(row["input_tokens"])
-        out_tok = int(row["output_tokens"])
-        if record_savings and not self._read_only:
-            with self._tx():
-                self._conn.execute(
-                    "UPDATE gate_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'avoided_calls'"
-                )
-                self._conn.execute(
-                    "UPDATE gate_meta SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT) WHERE key = 'saved_input_tokens'",
-                    (in_tok,),
-                )
-                self._conn.execute(
-                    "UPDATE gate_meta SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT) WHERE key = 'saved_output_tokens'",
-                    (out_tok,),
-                )
-                self._conn.execute(
-                    "UPDATE verified_outcome_cache SET hit_count = hit_count + 1 WHERE task_id = ? AND prompt_sha256 = ?",
-                    (task_id, p_sha),
-                )
-
         return CachedStepOutcome(
             task_id=task_id,
             cache_hit=True,
@@ -1802,8 +1423,8 @@ class HybridEvidenceGate:
             payload_text=str(row["payload_text"]),
             outcome_sha256=payload_sha,
             receipt_id=str(row["receipt_id"]),
-            saved_input_tokens=in_tok,
-            saved_output_tokens=out_tok,
+            saved_input_tokens=int(row["input_tokens"]),
+            saved_output_tokens=int(row["output_tokens"]),
         )
 
     def run_cached_step(
@@ -1811,9 +1432,6 @@ class HybridEvidenceGate:
         task_id: str,
         prompt_text: str,
         step_fn: Callable[[str], str | tuple[str, int, int]],
-        *,
-        action: int | None = None,
-        normative_context: Any = None,
     ) -> CachedStepOutcome:
         """Executes ``step_fn(prompt_text)`` only on cache miss/``HOLD``, bypassing 100% of LLM tokens on ``ALLOW``.
 
@@ -1824,26 +1442,9 @@ class HybridEvidenceGate:
         if not isinstance(prompt_text, str) or not prompt_text:
             raise ValidationError("invalid_prompt_text")
         p_sha = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
-        hit = self.lookup_verified_outcome(
-            task_id,
-            p_sha,
-            record_savings=True,
-            action=action,
-            normative_context=normative_context,
-        )
+        hit = self.lookup_verified_outcome(task_id, p_sha)
         if hit.cache_hit:
             return hit
-
-        if self._normative is not None or action is not None or normative_context is not None:
-            if self._normative is None or action is None or normative_context is None:
-                return CachedStepOutcome(task_id, False, "HOLD", "normative_gate_incomplete_configuration")
-            try:
-                verdict = self._normative.evaluate(action, normative_context)
-            except Exception as exc:
-                return CachedStepOutcome(task_id, False, "HOLD", f"normative_gate_error:{type(exc).__name__}")
-            v_decision = verdict.decision if verdict.decision in ("ALLOW", "HOLD", "DENY") else "HOLD"
-            if v_decision != "ALLOW":
-                return CachedStepOutcome(task_id, False, v_decision, verdict.reason)
 
         lease = self.begin_work(task_id)
         result = step_fn(prompt_text)
@@ -1874,150 +1475,17 @@ class HybridEvidenceGate:
             saved_output_tokens=0,
         )
 
-    def token_savings_summary(self) -> dict[str, int]:
-        """Returns cumulative avoided LLM calls and saved input/output token counts."""
-        meta = {
-            r["key"]: int(r["value"])
-            for r in self._conn.execute(
-                "SELECT key, value FROM gate_meta WHERE key IN ('avoided_calls', 'saved_input_tokens', 'saved_output_tokens')"
-            ).fetchall()
-        }
-        avoided = meta.get("avoided_calls", 0)
-        saved_in = meta.get("saved_input_tokens", 0)
-        saved_out = meta.get("saved_output_tokens", 0)
-        return {
-            "avoided_calls": avoided,
-            "saved_input_tokens": saved_in,
-            "saved_output_tokens": saved_out,
-            "saved_total_tokens": saved_in + saved_out,
-        }
-
-    def token_monitoring_report(
-        self,
-        *,
-        input_price_per_1m: float = 3.0,
-        output_price_per_1m: float = 15.0,
-    ) -> dict[str, Any]:
-        """Returns a comprehensive token & USD cost savings monitoring report with per-task breakdown.
-
-        Args:
-            input_price_per_1m: Reference LLM input price in USD per 1,000,000 tokens.
-            output_price_per_1m: Reference LLM output price in USD per 1,000,000 tokens.
-        """
-        if (
-            not isinstance(input_price_per_1m, (int, float))
-            or isinstance(input_price_per_1m, bool)
-            or input_price_per_1m < 0
-            or not isinstance(output_price_per_1m, (int, float))
-            or isinstance(output_price_per_1m, bool)
-            or output_price_per_1m < 0
-        ):
-            raise ValidationError("invalid_token_pricing")
-
-        keys = (
-            "avoided_calls",
-            "saved_input_tokens",
-            "saved_output_tokens",
-            "executed_calls",
-            "executed_input_tokens",
-            "executed_output_tokens",
-            "kv_prompts_built",
-            "kv_prefix_chars_total",
-            "kv_prompt_chars_total",
-        )
-        placeholders = ",".join("?" for _ in keys)
-        meta = {
-            r["key"]: int(r["value"])
-            for r in self._conn.execute(
-                f"SELECT key, value FROM gate_meta WHERE key IN ({placeholders})",
-                keys,
-            ).fetchall()
-        }
-        avoided = meta.get("avoided_calls", 0)
-        exec_calls = meta.get("executed_calls", 0)
-        total_reqs = avoided + exec_calls
-
-        saved_in = meta.get("saved_input_tokens", 0)
-        saved_out = meta.get("saved_output_tokens", 0)
-        saved_tot = saved_in + saved_out
-
-        exec_in = meta.get("executed_input_tokens", 0)
-        exec_out = meta.get("executed_output_tokens", 0)
-        exec_tot = exec_in + exec_out
-
-        denom_toks = exec_tot + saved_tot
-        savings_pct = round((saved_tot / denom_toks) * 100.0, 2) if denom_toks > 0 else 0.0
-        hit_rate_pct = round((avoided / total_reqs) * 100.0, 2) if total_reqs > 0 else 0.0
-
-        spent_usd = (exec_in / 1_000_000.0) * float(input_price_per_1m) + (exec_out / 1_000_000.0) * float(output_price_per_1m)
-        saved_usd = (saved_in / 1_000_000.0) * float(input_price_per_1m) + (saved_out / 1_000_000.0) * float(output_price_per_1m)
-        denom_usd = spent_usd + saved_usd
-        cost_red_pct = round((saved_usd / denom_usd) * 100.0, 2) if denom_usd > 0 else 0.0
-
-        kv_built = meta.get("kv_prompts_built", 0)
-        kv_pref_chars = meta.get("kv_prefix_chars_total", 0)
-        kv_tot_chars = meta.get("kv_prompt_chars_total", 0)
-        kv_share_pct = round((kv_pref_chars / kv_tot_chars) * 100.0, 2) if kv_tot_chars > 0 else 0.0
-
-        top_rows = self._conn.execute(
-            """
-            SELECT task_id,
-                   SUM(hit_count) AS hit_count,
-                   SUM(hit_count * input_tokens) AS saved_in,
-                   SUM(hit_count * output_tokens) AS saved_out,
-                   SUM(hit_count * (input_tokens + output_tokens)) AS saved_tot
-            FROM verified_outcome_cache
-            GROUP BY task_id
-            HAVING SUM(hit_count) > 0
-            ORDER BY saved_tot DESC, task_id ASC
-            """
-        ).fetchall()
-        top_tasks = [
-            {
-                "task_id": str(r["task_id"]),
-                "hit_count": int(r["hit_count"]),
-                "saved_input_tokens": int(r["saved_in"]),
-                "saved_output_tokens": int(r["saved_out"]),
-                "saved_total_tokens": int(r["saved_tot"]),
-            }
-            for r in top_rows
-        ]
-
-        return {
-            "executed_calls": exec_calls,
-            "avoided_calls": avoided,
-            "total_requests": total_reqs,
-            "call_hit_rate_pct": hit_rate_pct,
-            "executed_input_tokens": exec_in,
-            "executed_output_tokens": exec_out,
-            "executed_total_tokens": exec_tot,
-            "saved_input_tokens": saved_in,
-            "saved_output_tokens": saved_out,
-            "saved_total_tokens": saved_tot,
-            "overall_token_savings_pct": savings_pct,
-            "estimated_cost_spent_usd": round(spent_usd, 6),
-            "estimated_cost_saved_usd": round(saved_usd, 6),
-            "overall_cost_savings_pct": cost_red_pct,
-            "kv_prompts_built": kv_built,
-            "kv_prefix_char_share_pct": kv_share_pct,
-            "top_tasks": top_tasks,
-        }
-
     def partition_for_kv_cache(
         self,
         task_id: str,
         *,
         pin_order: Sequence[str] | None = None,
     ) -> KVPinnedContextPlan:
-        """Partitions bound dependencies into deterministic ``stable_prefix_ids`` and ``changed_suffix_ids``.
-
-        Orders items by ``(last_mutated_ns ASC, bind_seq ASC, evidence_id ASC)`` (or explicit
-        ``pin_order`` when provided) and inspects external providers with a single batched
-        ``inspect_many`` call per provider.
-        """
+        """Lock-free partition of bound dependencies into ``stable_prefix_ids`` and ``changed_suffix_ids``."""
         validate_identifier(task_id, "task_id")
         validated_pin = self._validate_pin_order(pin_order)
-        deps = self._fetch_task_dep_rows(task_id)
+        with self._read_snapshot():
+            deps = self._fetch_task_dep_rows(task_id)
         if not deps:
             raise ValidationError("task_has_no_bound_dependencies")
 
@@ -2070,23 +1538,13 @@ class HybridEvidenceGate:
         external_texts: Mapping[str, str] | None = None,
         pin_order: Sequence[str] | None = None,
     ) -> KVPinnedContextPlan:
-        """Builds a 100% lossless KV-cache-optimized prompt for ``task_id``.
-
-        Places ``system_header`` + unchanged ``stable_prefix_ids`` first in stable
-        ``(last_mutated_ns ASC, bind_seq ASC, evidence_id ASC)`` order (or explicit
-        ``pin_order`` when supplied) so re-bound mutated items stay at the tail instead of
-        thrashing unchanged prefix items. Followed by 100% full raw text of
-        ``changed_suffix_ids``, and ``<QUESTION>`` at the tail. Uses independent collision-free
-        tag escalation so evidence delimiters depend strictly on evidence payloads (never on
-        ``question``) while ``question`` gets its own isolated safe tag. External providers are
-        inspected via a single batched ``inspect_many`` call per provider, while local files use
-        single-FD ``read_verified_text`` TOCTOU protection.
-        """
+        """Lock-free builder for a 100% lossless KV-cache-optimized prompt for ``task_id``."""
         validate_identifier(task_id, "task_id")
         if not isinstance(question, str) or not question.strip():
             raise ValidationError("invalid_question")
         validated_pin = self._validate_pin_order(pin_order)
-        deps = self._fetch_task_dep_rows(task_id)
+        with self._read_snapshot():
+            deps = self._fetch_task_dep_rows(task_id)
         if not deps:
             raise ValidationError("task_has_no_bound_dependencies")
 
@@ -2094,7 +1552,6 @@ class HybridEvidenceGate:
         stable_rows: list[sqlite3.Row] = []
         changed_rows: list[sqlite3.Row] = []
         item_bodies: dict[str, tuple[str, str | None, str, str]] = {}
-        # value: (provider, raw_body_or_none, escaped_uri, sha_for_pointer)
 
         for r in deps:
             eid = str(r["evidence_id"])
@@ -2133,13 +1590,16 @@ class HybridEvidenceGate:
 
                 ok, _, _ = self._evaluate_external_dep_snapshot(r, snap, err)
                 if external_texts is not None and eid in external_texts:
+                    # Fail-closed: NEVER inline untrusted external_texts for REVOKED / UNAVAILABLE / UNKNOWN items
+                    if live_active_sha is None:
+                        raise ValidationError(f"inactive_external_text_rejected:{eid}")
                     ext_body = external_texts[eid]
                     if not isinstance(ext_body, str):
                         raise ValidationError("invalid_external_text")
                     ext_sha = hashlib.sha256(ext_body.encode("utf-8")).hexdigest()
                     if ok and ext_sha != r["bound_sha256"]:
                         raise ValidationError(f"external_text_sha256_mismatch:{eid}")
-                    if live_active_sha is not None and ext_sha != live_active_sha:
+                    if ext_sha != live_active_sha:
                         raise ValidationError(f"external_text_sha256_mismatch:{eid}")
                     item_bodies[eid] = (prov, ext_body, r["uri"], ext_sha)
                 else:
@@ -2154,22 +1614,38 @@ class HybridEvidenceGate:
         changed_ids = self._order_kv_rows(changed_rows, pin_order=validated_pin)
 
         # Deterministic collision-free delimiter escalation:
-        # 1. Compute <CONTEXT>/<EVIDENCE> tags strictly from system_header + evidence payloads
-        #    (NEVER from question) so user questions containing <EVIDENCE> never bust KV prefix.
-        # 2. Compute <QUESTION> tag independently so question content is safely isolated at the tail.
-        evidence_raw_strings = [system_header] + [
-            body for (_, body, _, _) in item_bodies.values() if body is not None
+        # 1. Prefix <EVIDENCE> tag depends strictly on system_header + stable_prefix_ids.
+        # 2. Suffix <EVIDENCE> tag escalates independently for changed_suffix_ids.
+        # 3. <QUESTION> tag escalates independently at the tail.
+        stable_raw_strings = [system_header] + [
+            item_bodies[eid][1] for eid in stable_ids if item_bodies[eid][1] is not None
         ]
-        ev_esc_idx = 0
-        while True:
-            ev_sfx = "" if ev_esc_idx == 0 else f"_{ev_esc_idx}"
-            ctx_tag, ev_tag = f"CONTEXT{ev_sfx}", f"EVIDENCE{ev_sfx}"
-            ev_markers = (f"<{ctx_tag}", f"</{ctx_tag}", f"<{ev_tag}", f"</{ev_tag}")
-            if not any(m in text for text in evidence_raw_strings for m in ev_markers):
-                break
-            ev_esc_idx += 1
+        suffix_raw_strings = [
+            item_bodies[eid][1] for eid in changed_ids if item_bodies[eid][1] is not None
+        ]
+        all_ev_strings = stable_raw_strings + suffix_raw_strings
 
-        q_check_strings = [question] + evidence_raw_strings
+        ctx_idx = 0
+        while True:
+            ctx_sfx = "" if ctx_idx == 0 else f"_{ctx_idx}"
+            ctx_tag = f"CONTEXT{ctx_sfx}"
+            if not any(m in text for text in all_ev_strings for m in (f"<{ctx_tag}", f"</{ctx_tag}")):
+                break
+            ctx_idx += 1
+
+        def _pick_ev_tag(corpus: list[str]) -> str:
+            idx = 0
+            while True:
+                sfx = "" if idx == 0 else f"_{idx}"
+                tag = f"EVIDENCE{sfx}"
+                if not any(m in text for text in corpus for m in (f"<{tag}", f"</{tag}")):
+                    return tag
+                idx += 1
+
+        prefix_ev_tag = _pick_ev_tag(stable_raw_strings)
+        suffix_ev_tag = _pick_ev_tag(suffix_raw_strings) if suffix_raw_strings else prefix_ev_tag
+
+        q_check_strings = [question] + all_ev_strings
         q_esc_idx = 0
         while True:
             q_sfx = "" if q_esc_idx == 0 else f"_{q_esc_idx}"
@@ -2179,17 +1655,18 @@ class HybridEvidenceGate:
                 break
             q_esc_idx += 1
 
-        def _render_one(eid: str) -> str:
+        def _render_one(eid: str, ev_tag: str) -> str:
             prov, raw_body, uri, ptr_sha = item_bodies[eid]
             safe_eid = html.escape(eid, quote=True)
             safe_prov = html.escape(prov, quote=True)
             if raw_body is not None:
                 return f"<{ev_tag} id=\"{safe_eid}\" provider=\"{safe_prov}\">\n{raw_body}\n</{ev_tag}>"
             safe_uri = html.escape(uri, quote=True)
-            return f"<{ev_tag} id=\"{safe_eid}\" provider=\"{safe_prov}\" uri=\"{safe_uri}\" sha256=\"{ptr_sha}\" />"
+            state_attr = ' state="UNAVAILABLE"' if ptr_sha == "0" * 64 else ""
+            return f"<{ev_tag} id=\"{safe_eid}\" provider=\"{safe_prov}\" uri=\"{safe_uri}\" sha256=\"{ptr_sha}\"{state_attr} />"
 
-        prefix_blocks = [_render_one(eid) for eid in stable_ids]
-        suffix_blocks = [_render_one(eid) for eid in changed_ids]
+        prefix_blocks = [_render_one(eid, prefix_ev_tag) for eid in stable_ids]
+        suffix_blocks = [_render_one(eid, suffix_ev_tag) for eid in changed_ids]
 
         prefix_section = f"{system_header.strip()}\n\n<{ctx_tag}>\n" + "\n\n".join(prefix_blocks)
         prefix_len = len(prefix_section)
@@ -2200,75 +1677,12 @@ class HybridEvidenceGate:
             full_ctx = f"{prefix_section}\n</{ctx_tag}>"
 
         rendered = f"{full_ctx}\n\n<{q_tag}>\n{question.strip()}\n</{q_tag}>\n"
-        if not self._read_only:
-            with self._tx():
-                self._conn.execute(
-                    "UPDATE gate_meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) WHERE key = 'kv_prompts_built'"
-                )
-                self._conn.execute(
-                    "UPDATE gate_meta SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT) WHERE key = 'kv_prefix_chars_total'",
-                    (prefix_len,),
-                )
-                self._conn.execute(
-                    "UPDATE gate_meta SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT) WHERE key = 'kv_prompt_chars_total'",
-                    (len(rendered),),
-                )
         return KVPinnedContextPlan(
             task_id=task_id,
             stable_prefix_ids=stable_ids,
             changed_suffix_ids=changed_ids,
             rendered_prompt=rendered,
             prefix_char_length=prefix_len,
-        )
-
-    # ------------------------------------------------------------------
-    # Fast-Path Router for Single-File Standalone Checks
-    # ------------------------------------------------------------------
-    def fast_record(self, cache_key: str, file_path: str | Path, *, outcome_sha256: str) -> dict[str, str]:
-        """Records a lightweight single-file hash cache entry without task-graph overhead."""
-        self._require_writable()
-        validate_identifier(cache_key, "cache_key")
-        outcome_sha256 = validate_sha256(outcome_sha256, "outcome_sha256")
-        uri, file_sha = self._local.resolve_and_hash(file_path)
-        with self._tx():
-            self._conn.execute(
-                """
-                INSERT INTO fast_file_cache(cache_key, file_uri, file_sha256, outcome_sha256, updated_ns)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    file_uri = excluded.file_uri,
-                    file_sha256 = excluded.file_sha256,
-                    outcome_sha256 = excluded.outcome_sha256,
-                    updated_ns = excluded.updated_ns
-                """,
-                (cache_key, uri, file_sha, outcome_sha256, time.time_ns()),
-            )
-        return {"cache_key": cache_key, "file_uri": uri, "file_sha256": file_sha, "outcome_sha256": outcome_sha256}
-
-    def fast_check(self, cache_key: str, file_path: str | Path) -> GateCheckResult:
-        """Checks whether ``file_path`` still matches the recorded ``cache_key`` URI and SHA-256."""
-        validate_identifier(cache_key, "cache_key")
-        row = self._conn.execute(
-            "SELECT file_uri, file_sha256, outcome_sha256 FROM fast_file_cache WHERE cache_key = ?",
-            (cache_key,),
-        ).fetchone()
-        if row is None:
-            return GateCheckResult(cache_key, "HOLD", "fast_cache_miss")
-        try:
-            live_uri, live_sha = self._local.resolve_and_hash(file_path)
-        except Exception as exc:
-            code = getattr(exc, "code", type(exc).__name__)
-            return GateCheckResult(cache_key, "HOLD", f"fast_cache_unreadable:{code}")
-        if live_uri != row["file_uri"]:
-            return GateCheckResult(cache_key, "HOLD", "fast_cache_file_uri_mismatch")
-        if live_sha != row["file_sha256"]:
-            return GateCheckResult(cache_key, "HOLD", "fast_cache_file_changed")
-        return GateCheckResult(
-            cache_key,
-            "ALLOW",
-            "fast_cache_hit",
-            outcome_sha256=row["outcome_sha256"],
-            checked_dependencies=1,
         )
 
     # ------------------------------------------------------------------
@@ -2311,7 +1725,7 @@ class HybridEvidenceGate:
         return int(row["n"]) if row is not None else 0
 
     def verify_chain(self) -> dict[str, Any]:
-        """Verifies every receipt row and head anchor against modification, gap, or tail truncation."""
+        """Streams every receipt row and head anchor against modification, gap, or tail truncation."""
         with self._read_snapshot():
             try:
                 meta = {
@@ -2330,80 +1744,82 @@ class HybridEvidenceGate:
                     "checked_receipts": 0,
                 }
 
-            rows = self._conn.execute(
+            cur = self._conn.execute(
                 """
                 SELECT seq, receipt_id, task_id, decision, reason, dependency_digest,
                        outcome_sha256, prev_chain_sha256, chain_sha256, created_ns
                 FROM audit_receipts
                 ORDER BY seq ASC
                 """
-            ).fetchall()
-        expected_prev = GENESIS_CHAIN_HASH
-        for idx, r in enumerate(rows, start=1):
-            seq = int(r["seq"])
-            if seq != idx:
-                return {
-                    "ok": False,
-                    "reason": "sequence_gap_detected",
-                    "first_bad_seq": seq,
-                    "checked_receipts": idx - 1,
-                }
-            if r["prev_chain_sha256"] != expected_prev:
-                return {
-                    "ok": False,
-                    "reason": "prev_chain_mismatch",
-                    "first_bad_seq": seq,
-                    "checked_receipts": idx - 1,
-                }
-            recomputed = _compute_chain_hash(
-                expected_prev,
-                seq,
-                r["receipt_id"],
-                r["task_id"],
-                r["decision"],
-                r["reason"],
-                r["dependency_digest"],
-                r["outcome_sha256"],
-                int(r["created_ns"]),
             )
-            if recomputed != r["chain_sha256"]:
-                return {
-                    "ok": False,
-                    "reason": "chain_hash_mismatch",
-                    "first_bad_seq": seq,
-                    "checked_receipts": idx - 1,
-                }
-            expected_prev = recomputed
+            expected_prev = GENESIS_CHAIN_HASH
+            checked = 0
+            for idx, r in enumerate(cur, start=1):
+                seq = int(r["seq"])
+                if seq != idx:
+                    return {
+                        "ok": False,
+                        "reason": "sequence_gap_detected",
+                        "first_bad_seq": seq,
+                        "checked_receipts": idx - 1,
+                    }
+                if r["prev_chain_sha256"] != expected_prev:
+                    return {
+                        "ok": False,
+                        "reason": "prev_chain_mismatch",
+                        "first_bad_seq": seq,
+                        "checked_receipts": idx - 1,
+                    }
+                recomputed = _compute_chain_hash(
+                    expected_prev,
+                    seq,
+                    r["receipt_id"],
+                    r["task_id"],
+                    r["decision"],
+                    r["reason"],
+                    r["dependency_digest"],
+                    r["outcome_sha256"],
+                    int(r["created_ns"]),
+                )
+                if recomputed != r["chain_sha256"]:
+                    return {
+                        "ok": False,
+                        "reason": "chain_hash_mismatch",
+                        "first_bad_seq": seq,
+                        "checked_receipts": idx - 1,
+                    }
+                expected_prev = recomputed
+                checked = idx
 
-        if len(rows) != head_seq or expected_prev != head_chain:
+        if checked != head_seq or expected_prev != head_chain:
             return {
                 "ok": False,
                 "reason": "tail_truncation_or_head_mismatch",
-                "first_bad_seq": len(rows) + 1,
-                "checked_receipts": len(rows),
+                "first_bad_seq": checked + 1,
+                "checked_receipts": checked,
             }
 
         return {
             "ok": True,
             "reason": "verified",
             "first_bad_seq": None,
-            "checked_receipts": len(rows),
+            "checked_receipts": checked,
             "head_chain_sha256": expected_prev,
         }
 
     def status_summary(self) -> dict[str, Any]:
-        """Returns database counts, attached provider slugs, and cumulative token savings."""
-        ev_n = self._conn.execute("SELECT COUNT(*) AS n FROM evidence_sources").fetchone()["n"]
-        task_n = self._conn.execute("SELECT COUNT(*) AS n FROM task_specs").fetchone()["n"]
-        rcpt_n = self.receipt_count()
-        fast_n = self._conn.execute("SELECT COUNT(*) AS n FROM fast_file_cache").fetchone()["n"]
-        cached_n = self._conn.execute("SELECT COUNT(*) AS n FROM verified_outcome_cache").fetchone()["n"]
-        by_provider = {
-            r["provider"]: int(r["n"])
-            for r in self._conn.execute(
-                "SELECT provider, COUNT(*) AS n FROM evidence_sources GROUP BY provider ORDER BY provider"
-            ).fetchall()
-        }
+        """Lock-free snapshot returning database counts and attached provider slugs."""
+        with self._read_snapshot():
+            ev_n = self._conn.execute("SELECT COUNT(*) AS n FROM evidence_sources").fetchone()["n"]
+            task_n = self._conn.execute("SELECT COUNT(*) AS n FROM task_specs").fetchone()["n"]
+            rcpt_n = self.receipt_count()
+            cached_n = self._conn.execute("SELECT COUNT(*) AS n FROM verified_outcome_cache").fetchone()["n"]
+            by_provider = {
+                r["provider"]: int(r["n"])
+                for r in self._conn.execute(
+                    "SELECT provider, COUNT(*) AS n FROM evidence_sources GROUP BY provider ORDER BY provider"
+                ).fetchall()
+            }
         return {
             "schema": SCHEMA_VERSION,
             "project_root": str(self._root) if self._root is not None else None,
@@ -2413,7 +1829,5 @@ class HybridEvidenceGate:
             "evidence_by_provider": by_provider,
             "task_count": int(task_n),
             "receipt_count": int(rcpt_n),
-            "fast_cache_count": int(fast_n),
             "verified_outcome_cache_count": int(cached_n),
-            "token_savings": self.token_savings_summary(),
         }

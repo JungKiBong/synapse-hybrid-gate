@@ -2,9 +2,9 @@
 
 Verifies standalone lifecycle, 1-byte mutation invalidation, POSIX 0600 permissions, symlink & path-traversal
 blocking, multi-provider isolation (Mem0, Zep/Graphiti, Mories), circuit-breaker batch protection,
-normative gate fail-closed hooks, dual cache+receipt hash-chain tamper detection, 8-subagent KV-prefix
-sharing (>95%), adversarial XML delimiter escape escalation, optimistic concurrency leases, 6-process
-SQLite WAL concurrency, online atomic backup, v1/v2 -> v3 schema migration, and full CLI exit-code parity.
+dual cache+receipt hash-chain tamper detection, lock-free reads, 8-subagent KV-prefix sharing (>95%),
+adversarial XML delimiter escape escalation, optimistic concurrency leases, 6-process SQLite WAL concurrency,
+online atomic backup, strict v4 schema isolation, and full CLI exit-code parity.
 """
 from __future__ import annotations
 
@@ -25,11 +25,7 @@ from synapse_hybrid_gate import (
     CircuitBreakingAdapter,
     EvidenceConflictError,
     EvidenceSnapshot,
-    ExternalMemoryItem,
     HybridEvidenceGate,
-    LEGACY_SCHEMA_V1,
-    LEGACY_SCHEMA_V2,
-    NormativeVerdict,
     PathSecurityError,
     ReadOnlyGateError,
     SCHEMA_VERSION,
@@ -39,7 +35,6 @@ from synapse_hybrid_gate import (
     make_mem0_adapter,
     make_mories_adapter,
     make_zep_adapter,
-    migrate_database,
 )
 from synapse_hybrid_gate.cli import main as cli_main
 
@@ -53,16 +48,6 @@ def _run_cli(argv: list[str]) -> tuple[int, str]:
     with redirect_stdout(buf):
         code = cli_main(argv)
     return code, buf.getvalue()
-
-
-class _CustomNormativeGate:
-    def __init__(self, mode: str = "ALLOW") -> None:
-        self.mode = mode
-
-    def evaluate(self, action: int, context: object) -> NormativeVerdict:
-        if self.mode == "RAISE":
-            raise RuntimeError("boom")
-        return NormativeVerdict(decision=self.mode, reason=f"mode_{self.mode.lower()}")
 
 
 class _BatchAdapter:
@@ -290,26 +275,6 @@ class TestSynapseHybridGate(unittest.TestCase):
         self.assertFalse(cb.is_open)
         self.assertIsInstance(r4, EvidenceSnapshot)
 
-    def test_11_normative_gate_port_allow_deny_and_exception_fail_closed(self) -> None:
-        norm = _CustomNormativeGate("ALLOW")
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            f = root / "a.txt"
-            f.write_text("a", encoding="utf-8")
-            with HybridEvidenceGate(root / "n.db", project_root=root, normative_gate=norm) as gate:
-                gate.register_local_evidence("ev:a", f)
-                gate.register_task("task:n", "Normative")
-                gate.bind_task("task:n", ["ev:a"])
-                gate.record_receipt("task:n", outcome_sha256=_sha("ok"))
-
-                self.assertEqual(gate.check_task("task:n", action=1, normative_context={"ok": True}).decision, "ALLOW")
-                norm.mode = "DENY"
-                self.assertEqual(gate.check_task("task:n", action=1, normative_context={"ok": True}).decision, "DENY")
-                norm.mode = "RAISE"
-                res_err = gate.check_task("task:n", action=1, normative_context={"ok": True})
-                self.assertEqual(res_err.decision, "HOLD")
-                self.assertIn("normative_gate_error", res_err.reason)
-
     def test_12_evidence_revocation_bumps_epoch_and_lists_affected_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -335,20 +300,10 @@ class TestSynapseHybridGate(unittest.TestCase):
                 self.assertEqual(res_after.decision, "HOLD")
                 self.assertIn("epoch_changed_after_revocation", res_after.reason)
 
-    def test_13_fast_path_single_file_hash_cache(self) -> None:
+    def test_14_lossless_run_cached_step_and_lock_free_reads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            f = root / "quick.py"
-            f.write_text("print(1)\n", encoding="utf-8")
-            with HybridEvidenceGate(root / "f.db", project_root=root) as gate:
-                gate.fast_record("lint:quick", f, outcome_sha256=_sha("clean"))
-                self.assertEqual(gate.fast_check("lint:quick", f).decision, "ALLOW")
-                f.write_text("print(2)\n", encoding="utf-8")
-                self.assertEqual(gate.fast_check("lint:quick", f).decision, "HOLD")
-
-    def test_14_lossless_run_cached_step_and_token_monitoring_telemetry(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            db = root / "c.db"
             s1 = root / "shared.md"
             s1.write_text("Shared invariant\n", encoding="utf-8")
             calls = 0
@@ -358,7 +313,7 @@ class TestSynapseHybridGate(unittest.TestCase):
                 calls += 1
                 return '{"safe": true}', 2000, 100
 
-            with HybridEvidenceGate(root / "c.db", project_root=root) as gate:
+            with HybridEvidenceGate(db, project_root=root) as gate:
                 gate.register_local_evidence("ev:s1", s1)
                 gate.register_task("task:audit", "Audit")
                 gate.bind_task("task:audit", ["ev:s1"])
@@ -372,15 +327,15 @@ class TestSynapseHybridGate(unittest.TestCase):
                 self.assertTrue(o2.cache_hit)
                 self.assertTrue(o3.cache_hit)
                 self.assertEqual(calls, 1)
+                self.assertEqual(o2.saved_input_tokens, 2000)
+                self.assertEqual(o2.saved_output_tokens, 100)
 
-                rep = gate.token_monitoring_report(input_price_per_1m=3.0, output_price_per_1m=15.0)
-                self.assertEqual(rep["executed_calls"], 1)
-                self.assertEqual(rep["avoided_calls"], 2)
-                self.assertEqual(rep["saved_input_tokens"], 4000)
-                self.assertEqual(rep["saved_output_tokens"], 200)
-                self.assertEqual(rep["saved_total_tokens"], 4200)
-                self.assertAlmostEqual(rep["call_hit_rate_pct"], 66.67, places=2)
-                self.assertAlmostEqual(rep["overall_token_savings_pct"], 66.67, places=2)
+                # Verify read paths (lookup_verified_outcome & build_kv_pinned_prompt) perform ZERO SQLite writes!
+                changes_before = gate._conn.total_changes
+                hit = gate.lookup_verified_outcome("task:audit", _sha(plan.rendered_prompt))
+                _ = gate.build_kv_pinned_prompt("task:audit", question="Read-only prompt check")
+                self.assertTrue(hit.cache_hit)
+                self.assertEqual(gate._conn.total_changes, changes_before)
 
     def test_15_dual_tamper_detection_on_cache_payload_and_receipt_chain(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -533,9 +488,7 @@ class TestSynapseHybridGate(unittest.TestCase):
 
             with HybridEvidenceGate(db, project_root=root, read_only=True) as reader:
                 self.assertEqual(reader.check_task("task:ro").decision, "ALLOW")
-                hit = reader.lookup_verified_outcome(
-                    "task:ro", _sha(plan.rendered_prompt), record_savings=False
-                )
+                hit = reader.lookup_verified_outcome("task:ro", _sha(plan.rendered_prompt))
                 self.assertTrue(hit.cache_hit)
                 self.assertEqual(hit.payload_text, "ANS")
                 with self.assertRaises(ReadOnlyGateError):
@@ -631,76 +584,31 @@ class TestSynapseHybridGate(unittest.TestCase):
                 self.assertTrue(restored.verify_chain()["ok"])
                 self.assertEqual(restored.check_task("task:b").decision, "ALLOW")
 
-    def test_23_legacy_v1_and_v2_blocked_until_explicit_migrate(self) -> None:
+    def test_23_incompatible_legacy_schema_rejected_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            v1_db = root / "legacy_v1.db"
-            conn = sqlite3.connect(str(v1_db))
+            old_db = root / "legacy_v3.db"
+            conn = sqlite3.connect(str(old_db))
             conn.executescript(
                 f"""
                 CREATE TABLE gate_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 INSERT INTO gate_meta(key, value) VALUES
-                    ('schema', '{LEGACY_SCHEMA_V1}'),
+                    ('schema', 'synapse-hybrid-gate-sqlite-v3'),
                     ('project_root', ''),
                     ('head_seq', '0'),
                     ('head_chain_sha256', '{"0" * 64}');
-                CREATE TABLE evidence_sources (
-                    evidence_id TEXT PRIMARY KEY,
-                    backend TEXT NOT NULL,
-                    uri TEXT NOT NULL,
-                    external_id TEXT NOT NULL,
-                    epoch INTEGER NOT NULL,
-                    active_revision INTEGER NOT NULL,
-                    content_sha256 TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    certified INTEGER NOT NULL,
-                    require_certified INTEGER NOT NULL,
-                    updated_ns INTEGER NOT NULL
-                );
-                CREATE TABLE task_specs (task_id TEXT PRIMARY KEY, title TEXT NOT NULL, created_ns INTEGER NOT NULL);
-                CREATE TABLE task_dependencies (
-                    task_id TEXT NOT NULL REFERENCES task_specs(task_id),
-                    evidence_id TEXT NOT NULL REFERENCES evidence_sources(evidence_id),
-                    bound_epoch INTEGER NOT NULL,
-                    bound_revision INTEGER NOT NULL,
-                    bound_sha256 TEXT NOT NULL,
-                    PRIMARY KEY (task_id, evidence_id)
-                );
-                CREATE TABLE audit_receipts (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    receipt_id TEXT NOT NULL UNIQUE,
-                    task_id TEXT NOT NULL REFERENCES task_specs(task_id),
-                    decision TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    dependency_digest TEXT NOT NULL,
-                    outcome_sha256 TEXT NOT NULL,
-                    prev_chain_sha256 TEXT NOT NULL,
-                    chain_sha256 TEXT NOT NULL,
-                    created_ns INTEGER NOT NULL
-                );
-                CREATE TABLE fast_file_cache (
-                    cache_key TEXT PRIMARY KEY,
-                    file_uri TEXT NOT NULL,
-                    file_sha256 TEXT NOT NULL,
-                    outcome_sha256 TEXT NOT NULL,
-                    updated_ns INTEGER NOT NULL
-                );
                 """
             )
             conn.commit()
             conn.close()
 
             with self.assertRaises(SchemaVersionError):
-                HybridEvidenceGate(v1_db)
+                HybridEvidenceGate(old_db)
+            with self.assertRaises(SchemaVersionError):
+                HybridEvidenceGate(old_db, read_only=True)
 
-            mig = migrate_database(v1_db)
-            self.assertEqual(mig["migrated_from"], LEGACY_SCHEMA_V1)
-            self.assertEqual(mig["migrated_to"], SCHEMA_VERSION)
-            self.assertTrue(mig["changed"])
-
-            with HybridEvidenceGate(v1_db) as upgraded:
-                self.assertEqual(upgraded.status_summary()["schema"], SCHEMA_VERSION)
-                self.assertNotEqual(LEGACY_SCHEMA_V2, SCHEMA_VERSION)
+            with HybridEvidenceGate(root / "fresh_v4.db") as fresh:
+                self.assertEqual(fresh.status_summary()["schema"], SCHEMA_VERSION)
 
     def test_24_cli_exit_codes_0_2_3_strict_separation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -740,7 +648,7 @@ class TestSynapseHybridGate(unittest.TestCase):
             self.assertEqual(c_bad, 3)
             self.assertIn("ValidationError", out_bad)
 
-    def test_25_cli_build_prompt_cache_store_cache_lookup_and_monitor(self) -> None:
+    def test_25_cli_build_prompt_cache_store_cache_lookup_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             db = str(root / "pcli.db")
@@ -781,17 +689,23 @@ class TestSynapseHybridGate(unittest.TestCase):
             )
             self.assertEqual(c_store, 0)
 
-            # Lookup now hits cache (exit 0) and records 1,718 saved tokens
+            # Lookup now hits cache (exit 0) and reports per-hit saved tokens without writing to SQLite
             c_hit, hit_json = _run_cli(
-                ["--db", db, "--project-root", str(root), "cache-lookup", "--task-id", "task:tls", "--prompt-sha256", p_sha]
+                ["--db", db, "--project-root", str(root), "--read-only", "cache-lookup", "--task-id", "task:tls", "--prompt-sha256", p_sha]
             )
             self.assertEqual(c_hit, 0)
-            self.assertEqual(json.loads(hit_json)["payload_text"], '{"margin_ms": 100}')
+            hit_data = json.loads(hit_json)
+            self.assertEqual(hit_data["payload_text"], '{"margin_ms": 100}')
+            self.assertEqual(hit_data["saved_input_tokens"], 1675)
+            self.assertEqual(hit_data["saved_output_tokens"], 43)
 
-            c_mon, mon_table = _run_cli(["--db", db, "monitor", "--format", "table"])
-            self.assertEqual(c_mon, 0)
-            self.assertIn("1 avoided / 2 total", mon_table)
-            self.assertIn("1,718", mon_table)
+            c_st, st_json = _run_cli(["--db", db, "--read-only", "status"])
+            self.assertEqual(c_st, 0)
+            self.assertEqual(json.loads(st_json)["verified_outcome_cache_count"], 1)
+
+            c_vc, vc_json = _run_cli(["--db", db, "--read-only", "verify-chain"])
+            self.assertEqual(c_vc, 0)
+            self.assertTrue(json.loads(vc_json)["ok"])
 
     def test_26_zero_external_runtime_dependencies_on_fresh_interpreter(self) -> None:
         src_dir = str(Path(__file__).resolve().parents[1] / "src")

@@ -2,6 +2,21 @@
 
 All notable changes to `synapse-hybrid-gate` are documented in this file.
 
+## [0.4.0] - 2026-11-21
+
+### Breaking Changes (Hardening & Slim-Down)
+- **Schema `v4` (`synapse-hybrid-gate-sqlite-v4`) & Removal of Pre-OSS Migrations**: Removed `LEGACY_SCHEMA_V1`, `LEGACY_SCHEMA_V2`, `migrate_database`, and the `migrate` CLI subcommand. Opening pre-`v4` databases fails closed with `SchemaVersionError`.
+- **100% Lock-Free Read Paths**: Removed read-path `BEGIN IMMEDIATE` telemetry counter writes from `lookup_verified_outcome()` and `build_kv_pinned_prompt()`, along with `gate_meta` token/USD counters, `token_savings_summary()`, `token_monitoring_report()`, and the `monitor` / `token-stats` CLI subcommands. `CachedStepOutcome.saved_input_tokens` and `saved_output_tokens` remain available on every cache hit with zero SQLite writes.
+- **Vendor-Neutral Adapters Only**: Removed legacy Mories compatibility aliases (`MoriesItemState`, `MoriesEvidenceAdapter`, `OfflineMoriesAdapter`, `CallableMoriesAdapter`, `mories_adapter=`, `register_mories_evidence`, `refresh_mories_evidence`) and hardcoded `provider == "mories"` branches. Attach Mories via `providers={"mories": make_mories_adapter(...)}` and `register_external_evidence(..., provider="mories")`.
+- **Removed Orphaned / Dead Surfaces**: Removed `core_hook.py` (`NormativeVerdict`, `NormativeGatePort`, `SynapseCoreGateAdapter`), the orphaned `fast_file_cache` table (`fast_record`, `fast_check`, `fast-*` CLI), and the dead-end `register-external` / `register-mories` CLI subcommands.
+
+### Security & Bug Fixes
+- **Fail-Closed `external_texts` Verification (`store.py`)**: `build_kv_pinned_prompt()` now rejects caller-supplied `external_texts` with `ValidationError` whenever the live external item is `REVOKED`, `UNAVAILABLE`, or `UNKNOWN`, adds `state="UNAVAILABLE"` to unavailable pointers, and isolates suffix `<EVIDENCE>` delimiter escalation so mutated suffix payloads cannot bust the stable KV prefix.
+- **OCC Preflight Outside SQLite Write Lock (`store.py`)**: Moved live external RPCs and bounded local file hashing out of `BEGIN IMMEDIATE` in `record_receipt()` and `store_verified_outcome()`.
+- **Circuit Breaker Single-Item Adapter Bypass Fix (`adapters.py`)**: Added `has_batch_lookup` gating so `CircuitBreakingAdapter.inspect_many()` properly short-circuits wrapped single-item `CallableExternalAdapter` instances (such as `make_mem0_adapter(fn)`) after `failure_threshold` failures instead of looping `N × timeout`.
+- **Real Mem0 / Zep / Mories SDK Compatibility (`plugins.py`)**: `make_mem0_adapter` now treats `None` as `KeyError` (no false breaker trips), falls back to `"text"`, and maps `"replaced_by"` to `REVOKED`; `make_zep_adapter` accepts `None` and Pydantic/dataclass `EntityEdge` objects; `make_mories_adapter` treats `None` as `KeyError`.
+- **Audit Chain & CLI Robustness (`store.py`, `cli.py`, `adapters.py`)**: Recomputed `head_row` hash in `_verify_receipt_row_and_head()`, streamed `verify_chain()` with `O(1)` RAM, wrapped `status_summary()` in `_read_snapshot()`, normalized relative URIs with `.as_posix()`, and added `O_NONBLOCK` FIFO protection in CLI bounded file reads.
+
 ## [0.3.2] - 2026-11-21
 
 ### Fixed

@@ -15,7 +15,6 @@ from typing import Any, Callable, Protocol
 from .exceptions import PathSecurityError, ValidationError
 
 
-VALID_STATES = ("ACTIVE", "REVOKED", "UNAVAILABLE", "UNKNOWN")
 DEFAULT_MAX_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB DoS ceiling
 _PROVIDER_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
@@ -96,23 +95,12 @@ class ExternalMemoryItem:
             object.__setattr__(self, "metadata", dict(self.metadata))
 
 
-@dataclass(frozen=True)
-class MoriesItemState(ExternalMemoryItem):
-    """Backward-compatible Mories item model built on ``ExternalMemoryItem``."""
-
-    provider: str = "mories"
-
-
 class ExternalMemoryPort(Protocol):
     """Vendor-neutral read-only inspection port for any external memory or knowledge store."""
 
     def inspect(self, item_id: str) -> EvidenceSnapshot:
         """Inspects a single external item by ID and returns an ``EvidenceSnapshot``."""
         ...
-
-
-# Backward-compatible protocol alias
-MoriesEvidenceAdapter = ExternalMemoryPort
 
 
 class OfflineExternalAdapter:
@@ -128,11 +116,6 @@ class OfflineExternalAdapter:
     def inspect(self, item_id: str) -> EvidenceSnapshot:
         """Always returns a fail-closed ``UNAVAILABLE`` snapshot."""
         validate_identifier(item_id, "external_item_id")
-        reason = (
-            "mories_backend_unavailable:offline_adapter"
-            if self._provider == "mories"
-            else f"external_backend_unavailable:offline_adapter:{self._provider}"
-        )
         return EvidenceSnapshot(
             evidence_id=item_id,
             backend=self._provider,
@@ -141,19 +124,12 @@ class OfflineExternalAdapter:
             content_sha256="0" * 64,
             state="UNAVAILABLE",
             certified=False,
-            reason=reason,
+            reason=f"external_backend_unavailable:offline_adapter:{self._provider}",
         )
 
     def inspect_many(self, item_ids: Sequence[str]) -> dict[str, EvidenceSnapshot]:
         """Batch inspection helper returning fail-closed snapshots for each item ID."""
         return {iid: self.inspect(iid) for iid in item_ids}
-
-
-class OfflineMoriesAdapter(OfflineExternalAdapter):
-    """Backward-compatible offline fail-closed adapter for Mories."""
-
-    def __init__(self) -> None:
-        super().__init__(provider="mories")
 
 
 class CallableExternalAdapter:
@@ -175,6 +151,11 @@ class CallableExternalAdapter:
     @property
     def provider(self) -> str:
         return self._provider
+
+    @property
+    def has_batch_lookup(self) -> bool:
+        """Returns ``True`` only when a true batched ``batch_lookup_fn`` was supplied."""
+        return self._batch_lookup is not None
 
     def _validate_returned_item(self, item_id: str, item: ExternalMemoryItem, uri: str) -> EvidenceSnapshot:
         if not isinstance(item, ExternalMemoryItem):
@@ -209,11 +190,6 @@ class CallableExternalAdapter:
             item = self._lookup(item_id)
             return self._validate_returned_item(item_id, item, uri)
         except KeyError:
-            not_found_reason = (
-                "mories_item_not_found"
-                if self._provider == "mories"
-                else f"external_item_not_found:{self._provider}"
-            )
             return EvidenceSnapshot(
                 evidence_id=item_id,
                 backend=self._provider,
@@ -222,14 +198,9 @@ class CallableExternalAdapter:
                 content_sha256="0" * 64,
                 state="UNAVAILABLE",
                 certified=False,
-                reason=not_found_reason,
+                reason=f"external_item_not_found:{self._provider}",
             )
         except Exception as exc:
-            err_reason = (
-                f"mories_backend_unavailable:{type(exc).__name__}"
-                if self._provider == "mories"
-                else f"external_backend_unavailable:{self._provider}:{type(exc).__name__}"
-            )
             return EvidenceSnapshot(
                 evidence_id=item_id,
                 backend=self._provider,
@@ -238,7 +209,7 @@ class CallableExternalAdapter:
                 content_sha256="0" * 64,
                 state="UNAVAILABLE",
                 certified=False,
-                reason=err_reason,
+                reason=f"external_backend_unavailable:{self._provider}:{type(exc).__name__}",
             )
 
     def inspect_many(self, item_ids: Sequence[str]) -> dict[str, EvidenceSnapshot]:
@@ -249,11 +220,7 @@ class CallableExternalAdapter:
         try:
             raw_map = self._batch_lookup(validated_ids)
         except Exception as exc:
-            err_reason = (
-                f"mories_backend_unavailable:{type(exc).__name__}"
-                if self._provider == "mories"
-                else f"external_backend_unavailable:{self._provider}:{type(exc).__name__}"
-            )
+            err_reason = f"external_backend_unavailable:{self._provider}:{type(exc).__name__}"
             return {
                 iid: EvidenceSnapshot(
                     evidence_id=iid,
@@ -271,11 +238,6 @@ class CallableExternalAdapter:
         for iid in validated_ids:
             uri = f"{self._provider}://{self._namespace}/{iid}"
             if iid not in raw_map:
-                not_found_reason = (
-                    "mories_item_not_found"
-                    if self._provider == "mories"
-                    else f"external_item_not_found:{self._provider}"
-                )
                 out[iid] = EvidenceSnapshot(
                     evidence_id=iid,
                     backend=self._provider,
@@ -284,7 +246,7 @@ class CallableExternalAdapter:
                     content_sha256="0" * 64,
                     state="UNAVAILABLE",
                     certified=False,
-                    reason=not_found_reason,
+                    reason=f"external_item_not_found:{self._provider}",
                 )
             else:
                 try:
@@ -301,13 +263,6 @@ class CallableExternalAdapter:
                         reason=f"external_backend_unavailable:{self._provider}:{type(exc).__name__}",
                     )
         return out
-
-
-class CallableMoriesAdapter(CallableExternalAdapter):
-    """Backward-compatible Mories lookup wrapper built on ``CallableExternalAdapter``."""
-
-    def __init__(self, lookup_fn: Callable[[str], ExternalMemoryItem], *, project: str = "personal") -> None:
-        super().__init__(lookup_fn, provider="mories", namespace=project)
 
 
 class CircuitBreakingAdapter:
@@ -347,17 +302,17 @@ class CircuitBreakingAdapter:
         return self._provider
 
     @property
+    def has_batch_lookup(self) -> bool:
+        """Delegates batch-lookup capability to the wrapped adapter."""
+        return bool(getattr(self._inner, "has_batch_lookup", True))
+
+    @property
     def is_open(self) -> bool:
         """Returns ``True`` while the circuit breaker is open and fast-failing."""
         with self._lock:
             return time.monotonic() < self._open_until
 
     def _open_snapshot(self, item_id: str) -> EvidenceSnapshot:
-        reason = (
-            "mories_backend_unavailable:circuit_open"
-            if self._provider == "mories"
-            else f"external_backend_unavailable:{self._provider}:circuit_open"
-        )
         return EvidenceSnapshot(
             evidence_id=item_id,
             backend=self._provider,
@@ -366,7 +321,7 @@ class CircuitBreakingAdapter:
             content_sha256="0" * 64,
             state="UNAVAILABLE",
             certified=False,
-            reason=reason,
+            reason=f"external_backend_unavailable:{self._provider}:circuit_open",
         )
 
     def _record_batch_outage(self, had_transport_outage: bool) -> None:
@@ -393,11 +348,6 @@ class CircuitBreakingAdapter:
         try:
             snap = self._inner.inspect(item_id)
         except Exception as exc:
-            err_reason = (
-                f"mories_backend_unavailable:{type(exc).__name__}"
-                if self._provider == "mories"
-                else f"external_backend_unavailable:{self._provider}:{type(exc).__name__}"
-            )
             snap = EvidenceSnapshot(
                 evidence_id=item_id,
                 backend=self._provider,
@@ -406,7 +356,7 @@ class CircuitBreakingAdapter:
                 content_sha256="0" * 64,
                 state="UNAVAILABLE",
                 certified=False,
-                reason=err_reason,
+                reason=f"external_backend_unavailable:{self._provider}:{type(exc).__name__}",
             )
         self._record_outcome(snap)
         return snap
@@ -421,15 +371,14 @@ class CircuitBreakingAdapter:
                 return {iid: self._open_snapshot(iid) for iid in validated_ids}
 
         batch_fn = getattr(self._inner, "inspect_many", None)
-        if callable(batch_fn):
+        use_batch = callable(batch_fn) and bool(getattr(self._inner, "has_batch_lookup", True))
+        if use_batch:
             try:
                 snaps = batch_fn(validated_ids)
+                if not isinstance(snaps, Mapping):
+                    raise TypeError("invalid_batch_inspect_result")
             except Exception as exc:
-                err_reason = (
-                    f"mories_backend_unavailable:{type(exc).__name__}"
-                    if self._provider == "mories"
-                    else f"external_backend_unavailable:{self._provider}:{type(exc).__name__}"
-                )
+                err_reason = f"external_backend_unavailable:{self._provider}:{type(exc).__name__}"
                 snaps = {
                     iid: EvidenceSnapshot(
                         evidence_id=iid,
@@ -447,11 +396,11 @@ class CircuitBreakingAdapter:
                 return snaps
 
             had_outage = any(
-                s.state == "UNAVAILABLE" and "backend_unavailable" in s.reason
+                isinstance(s, EvidenceSnapshot) and s.state == "UNAVAILABLE" and "backend_unavailable" in s.reason
                 for s in snaps.values()
             )
             self._record_batch_outage(had_outage)
-            return snaps
+            return dict(snaps)
         return {iid: self.inspect(iid) for iid in validated_ids}
 
 
@@ -547,7 +496,7 @@ class LocalFileEvidenceAdapter:
             resolved = cur.resolve(strict=True)
             if not resolved.is_relative_to(self._root):
                 raise PathSecurityError("local_path_outside_project_root")
-            stored_uri = str(resolved.relative_to(self._root))
+            stored_uri = resolved.relative_to(self._root).as_posix()
             return stored_uri, cur
 
         if not p.is_absolute():

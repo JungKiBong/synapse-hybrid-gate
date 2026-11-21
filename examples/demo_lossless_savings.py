@@ -99,7 +99,8 @@ def main() -> None:
             except StaleWorkConflictError as exc:
                 print(f"[OCC Guard] Blocked stale parallel subagent commit: {exc.code}\n")
 
-        cli_main(["--db", str(db_path), "monitor", "--format", "table"])
+        cli_main(["--db", str(db_path), "status"])
+        cli_main(["--db", str(db_path), "verify-chain"])
 
 
 if __name__ == "__main__":

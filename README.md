@@ -67,28 +67,28 @@ Evaluated across **16 isolated live agent calls** (`6` rounds × `5` cross-docum
 
 </details>
 
-### 2. Engine Runtime, Security & Multi-Process Benchmarks (`v0.3.1`)
+### 2. Engine Runtime, Security & Multi-Process Benchmarks (`v0.4.0`)
 
 | Metric | Verified Result | Scope / Condition |
 |---|---|---|
-| **Verification Suites** | **`26 / 26` built-in `unittest` PASS** + **`32 / 32` release suite PASS** | Public `tests/test_synapse_hybrid_gate.py` (`0.35s`) + isolated wheel (`python3 -I -B`) release verification |
+| **Verification Suites** | **`32 / 32` built-in `unittest` / `pytest` PASS** | Public `tests/` (`0.44s`) — lock-free reads, fail-closed `external_texts`, OCC outside write lock, breaker & SDK regressions |
 | **8-Subagent Prefix Sharing (`H07`)** | **`95.6%`** shared prefix bytes | 8 parallel subagents querying distinct tasks over shared pinned specifications |
 | **Multi-Process SQLite WAL (`H08`)** | **`0` lock/snapshot errors** across **6 OS processes** | 4 concurrent `read_only=True` MVCC snapshot workers + 2 concurrent writers with OCC conflict blocking |
-| **Memory & Execution Footprint** | **`48.86 MiB` Peak RSS** (`6.37s` full suite) | Pure Python `>=3.11` standard library (`0` external pip dependencies) |
-| **Tamper & Escape Defenses (`H06`, `H07`)** | **`100%` blocked** (`HOLD` / `DENY`) | Dual cache+receipt hash-chain cross-verification, adversarial `</EVIDENCE>` tag escalation (`EVIDENCE_1`), `O_NOFOLLOW` symlink rejection, `0600` DB mode |
+| **Memory & Execution Footprint** | **Zero external runtime dependencies** | Pure Python `>=3.11` standard library (`dependencies = []`), `O(1)` RAM streaming `verify_chain()` |
+| **Tamper & Escape Defenses (`H06`, `H07`)** | **`100%` blocked** (`HOLD` / `DENY`) | Dual cache+receipt hash-chain cross-verification, isolated prefix/suffix/question XML tag escalation, `O_NOFOLLOW`/`O_NONBLOCK` guards, `0600` DB mode |
 
 ---
 
 ## 5-Minute Quickstart
 
 ```bash
-pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.1
+pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.4.0
 # Or from a local clone (run instant zero-API-key demo in < 0.2s):
 pip install .
 python3 examples/demo_lossless_savings.py
 ```
 
-### 1. Standalone Lossless LLM Caching, KV-Prefix Pinning & Token Telemetry
+### 1. Standalone Lossless LLM Caching & Lock-Free KV-Prefix Pinning
 
 ```python
 from synapse_hybrid_gate import HybridEvidenceGate
@@ -110,7 +110,7 @@ with HybridEvidenceGate("gate.db", project_root=".") as gate:
         plan.rendered_prompt,
         lambda prompt: ('{"safe": true}', 1800, 120),  # replace with your LLM API call
     )
-    print(outcome.cache_hit, gate.token_monitoring_report())
+    print(outcome.cache_hit, outcome.saved_input_tokens, outcome.saved_output_tokens)
 ```
 
 ### 2. Plugging in `Mem0`, `Zep/Graphiti`, `PostgreSQL`, or `Mories` (Zero Lock-in)
@@ -151,7 +151,7 @@ with HybridEvidenceGate("gate.db", project_root=".") as gate:
 
 ---
 
-## CLI Reference & Live Token Savings Monitor
+## CLI Reference
 
 Exit codes: `0` (`ALLOW` / OK), `2` (`HOLD` — stale, revoked, or offline dependency), `3` (`ERROR` / `DENY` / tampered chain / invalid CLI flag).
 
@@ -167,11 +167,8 @@ synapse-hybrid-gate --db gate.db --project-root . cache-store --task-id task:t1 
 synapse-hybrid-gate --db gate.db --project-root . cache-lookup --task-id task:t1 --prompt-sha256 <SHA256>
 synapse-hybrid-gate --db gate.db --read-only check-task --task-id task:t1
 
-# View cumulative avoided LLM calls, saved input/output tokens, hit rate %, and KV-pinned tokens:
-synapse-hybrid-gate --db gate.db monitor --format table
-synapse-hybrid-gate --db gate.db monitor --format json
-
-# Online safe SQLite backup (0600, symlink-safe) & hash-chain verification:
+# Ledger status, online safe SQLite backup (0600, symlink-safe) & streaming hash-chain verification:
+synapse-hybrid-gate --db gate.db status
 synapse-hybrid-gate --db gate.db backup --dest gate.backup.db
 synapse-hybrid-gate --db gate.db verify-chain
 ```
@@ -188,6 +185,6 @@ python3 examples/demo_lossless_savings.py
 ## Enterprise Security & Architectural Boundaries
 
 - **Zero Network Interception**: Never installs a local HTTP/HTTPS proxy, never intercepts API keys or TLS traffic, and opens zero network ports—compatible with strict corporate DLP/EDR policies and per-project opt-in integration across Claude Code, Codex, OpenCode, Cursor, and custom Python agents.
-- **Filesystem & Ledger Hardening**: Enforces bounded `project_root`, intermediate symlink rejection (`lstat` + `O_NOFOLLOW`), regular-file checks, a configurable `max_file_bytes` ceiling (default `64 MiB`), `0600` owner-only SQLite file permissions on POSIX, and SHA-256 hash-chained receipts.
-- **Explicit Schema Upgrades**: Opening an older `v1`/`v2` SQLite ledger raises `SchemaVersionError` until explicitly upgraded via `migrate_database(db_path)` or `synapse-hybrid-gate --db gate.db migrate`.
+- **Filesystem & Ledger Hardening**: Enforces bounded `project_root`, intermediate symlink rejection (`lstat` + `O_NOFOLLOW` + `O_NONBLOCK`), regular-file checks, a configurable `max_file_bytes` ceiling (default `64 MiB`), `0600` owner-only SQLite file permissions on POSIX, lock-free MVCC read paths, and SHA-256 hash-chained receipts.
+- **Strict Schema Isolation (`v4`)**: Opening an incompatible pre-`v4` SQLite ledger fails closed with `SchemaVersionError` rather than mutating legacy state in place.
 - Licensed under the **Apache License, Version 2.0** ([LICENSE](./LICENSE)).

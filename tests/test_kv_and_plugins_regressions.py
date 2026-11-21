@@ -14,14 +14,15 @@ import tempfile
 import unittest
 
 from synapse_hybrid_gate import (
+    CircuitBreakingAdapter,
     EvidenceConflictError,
     EvidenceSnapshot,
     HybridEvidenceGate,
     SCHEMA_VERSION,
     ValidationError,
+    make_mem0_adapter,
     make_mories_adapter,
     make_zep_adapter,
-    migrate_database,
 )
 
 
@@ -228,92 +229,6 @@ class TestKVPrefixAndPluginRegressions(unittest.TestCase):
                     gate.bind_task("task:pin", ["ev:a", "ev:m"], pin_order=["ev:a", "ev:a"])
                 with self.assertRaises(ValidationError):
                     gate.bind_task("task:pin", ["ev:a", "ev:m"], pin_order=["ev:unknown"])
-
-    def test_1a_legacy_v3_db_without_order_columns_migrates_and_supports_readonly(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            db_path = root / "legacy_v3.db"
-            fa = root / "a.md"
-            fb = root / "b.md"
-            fa.write_text("Doc A v1\n", encoding="utf-8")
-            fb.write_text("Doc B v1\n", encoding="utf-8")
-
-            # Seed with current gate, then strip bind_seq/last_mutated_ns to simulate pre-patch v3 DB
-            with HybridEvidenceGate(db_path, project_root=root) as gate:
-                gate.register_local_evidence("doc:a", fa)
-                gate.register_local_evidence("doc:b", fb)
-                gate.register_task("task:old", "Legacy v3 task")
-                gate.bind_task("task:old", ["doc:a", "doc:b"])
-                gate.record_receipt("task:old", outcome_sha256=_sha("ok"))
-
-            conn = sqlite3.connect(str(db_path))
-            conn.execute("PRAGMA foreign_keys=OFF")
-            conn.executescript(
-                """
-                CREATE TABLE task_dependencies_old (
-                    task_id TEXT NOT NULL REFERENCES task_specs(task_id) ON DELETE CASCADE,
-                    evidence_id TEXT NOT NULL REFERENCES evidence_sources(evidence_id),
-                    bound_epoch INTEGER NOT NULL CHECK(bound_epoch >= 1),
-                    bound_revision INTEGER NOT NULL CHECK(bound_revision >= 1),
-                    bound_sha256 TEXT NOT NULL,
-                    PRIMARY KEY (task_id, evidence_id)
-                );
-                INSERT INTO task_dependencies_old(task_id, evidence_id, bound_epoch, bound_revision, bound_sha256)
-                SELECT task_id, evidence_id, bound_epoch, bound_revision, bound_sha256 FROM task_dependencies;
-                DROP TABLE task_dependencies;
-                ALTER TABLE task_dependencies_old RENAME TO task_dependencies;
-
-                CREATE TABLE evidence_sources_old (
-                    evidence_id TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL CHECK(kind IN ('local', 'external')),
-                    provider TEXT NOT NULL,
-                    uri TEXT NOT NULL,
-                    external_id TEXT NOT NULL,
-                    epoch INTEGER NOT NULL CHECK(epoch >= 1),
-                    active_revision INTEGER NOT NULL CHECK(active_revision >= 1),
-                    content_sha256 TEXT NOT NULL,
-                    state TEXT NOT NULL CHECK(state IN ('ACTIVE', 'REVOKED')),
-                    certified INTEGER NOT NULL CHECK(certified IN (0, 1)),
-                    require_certified INTEGER NOT NULL CHECK(require_certified IN (0, 1)),
-                    updated_ns INTEGER NOT NULL,
-                    CHECK((kind = 'local' AND provider = 'local') OR (kind = 'external' AND provider <> 'local'))
-                );
-                INSERT INTO evidence_sources_old(
-                    evidence_id, kind, provider, uri, external_id, epoch, active_revision,
-                    content_sha256, state, certified, require_certified, updated_ns
-                )
-                SELECT
-                    evidence_id, kind, provider, uri, external_id, epoch, active_revision,
-                    content_sha256, state, certified, require_certified, updated_ns
-                FROM evidence_sources;
-                DROP TABLE evidence_sources;
-                ALTER TABLE evidence_sources_old RENAME TO evidence_sources;
-                """
-            )
-            conn.commit()
-            conn.close()
-
-            # Read-only worker on un-migrated pre-patch v3 DB must still work cleanly
-            with HybridEvidenceGate(db_path, project_root=root, read_only=True) as ro_gate:
-                self.assertEqual(ro_gate.check_task("task:old").decision, "ALLOW")
-                self.assertTrue(ro_gate.verify_chain()["ok"])
-                ro_plan = ro_gate.build_kv_pinned_prompt("task:old", question="RO query")
-                self.assertEqual(ro_plan.stable_prefix_ids, ("doc:a", "doc:b"))
-
-            # Explicit migrate_database patches missing columns idempotently
-            mig1 = migrate_database(db_path)
-            self.assertEqual(mig1, {"migrated_from": SCHEMA_VERSION, "migrated_to": SCHEMA_VERSION, "changed": True})
-            mig2 = migrate_database(db_path)
-            self.assertEqual(mig2, {"migrated_from": SCHEMA_VERSION, "migrated_to": SCHEMA_VERSION, "changed": False})
-
-            # Writable open preserves receipt chain and enables tail-ordering on re-bind
-            with HybridEvidenceGate(db_path, project_root=root) as rw_gate:
-                self.assertTrue(rw_gate.verify_chain()["ok"])
-                fa.write_text("Doc A v2\n", encoding="utf-8")
-                rw_gate.register_local_evidence("doc:a", fa)
-                rw_gate.bind_task("task:old", ["doc:a", "doc:b"])
-                plan = rw_gate.build_kv_pinned_prompt("task:old", question="Post-migration query")
-                self.assertEqual(plan.stable_prefix_ids, ("doc:b", "doc:a"))
 
     # ------------------------------------------------------------------
     # 1B: Question XML delimiter isolation from KV-prefix evidence tags
@@ -736,7 +651,7 @@ class TestKVPrefixAndPluginRegressions(unittest.TestCase):
                 Path(tmp) / "mories_meta.db",
                 providers={"mories": adapter},
             ) as gate:
-                reg_snap = gate.register_mories_evidence("ev:mor_rich", "mor_rich")
+                reg_snap = gate.register_external_evidence("ev:mor_rich", "mor_rich", provider="mories")
                 self.assertEqual(reg_snap.metadata, snap_rich.metadata)
                 gate.register_task("task:mor_meta", "Mories metadata check")
                 gate.bind_task("task:mor_meta", ["ev:mor_rich"])
@@ -856,6 +771,123 @@ class TestKVPrefixAndPluginRegressions(unittest.TestCase):
         for bad_key in ("mor_bad_pin_seq", "mor_bad_last_mutated", "mor_bad_namespace"):
             bad_snap = adapter.inspect(bad_key)
             self.assertEqual(bad_snap.state, "UNAVAILABLE", msg=f"{bad_key} should fail closed: {bad_snap}")
+
+    # ------------------------------------------------------------------
+    # 4: Red-team Blocker & Major regression fixes (v0.3.3 hardening)
+    # ------------------------------------------------------------------
+    def test_4_redteam_blockers_revoked_ext_text_breaker_bypass_write_lock_and_sdks(self) -> None:
+        # 4A. CircuitBreakingAdapter MUST trip on single-item CallableExternalAdapter (no batch_lookup_fn)
+        calls = {"n": 0}
+
+        def flaky_mem0(_item_id: str) -> dict:
+            calls["n"] += 1
+            raise ConnectionError("mem0_down")
+
+        cb = CircuitBreakingAdapter(make_mem0_adapter(flaky_mem0), failure_threshold=2, cooldown_seconds=5.0)
+        snaps = cb.inspect_many([f"k{i}" for i in range(10)])
+        self.assertEqual(calls["n"], 2)  # Short-circuited after 2 failures, NOT 10!
+        self.assertTrue(cb.is_open)
+        self.assertIn("circuit_open", snaps["k9"].reason)
+
+        # 4B. Mem0 real-SDK compatibility: 'text' fallback, 'replaced_by' -> REVOKED, None -> not_found (no trip!)
+        mem0_db: dict[str, dict | None] = {
+            "oss_item": {"id": "oss_item", "text": "OSS text field", "certified": True},
+            "superseded_item": {"id": "superseded_item", "memory": "Old fact", "replaced_by": "new_id", "certified": True},
+            "missing_item": None,
+        }
+        cb_mem0 = CircuitBreakingAdapter(
+            make_mem0_adapter(lambda k: mem0_db[k]), failure_threshold=2, cooldown_seconds=5.0
+        )
+        self.assertEqual(cb_mem0.inspect("oss_item").state, "ACTIVE")
+        self.assertEqual(cb_mem0.inspect("superseded_item").state, "REVOKED")
+        s_miss = cb_mem0.inspect("missing_item")
+        self.assertEqual(s_miss.state, "UNAVAILABLE")
+        self.assertEqual(s_miss.reason, "external_item_not_found:mem0")
+        self.assertFalse(cb_mem0.is_open)  # 404 None MUST NOT trip circuit breaker!
+
+        # 4B2. Mories None -> not_found without tripping breaker (vendor-neutral reason)
+        cb_mor = CircuitBreakingAdapter(
+            make_mories_adapter(lambda _k: None), failure_threshold=2, cooldown_seconds=5.0
+        )
+        s_mor_miss = cb_mor.inspect("missing_mor")
+        self.assertEqual(s_mor_miss.state, "UNAVAILABLE")
+        self.assertEqual(s_mor_miss.reason, "external_item_not_found:mories")
+        self.assertFalse(cb_mor.is_open)
+
+        # 4C. Zep attribute-based EntityEdge object compatibility
+        class _FakeEntityEdge:
+            uuid = "edge-1"
+            fact = "Deploy requires staging green"
+            certified = True
+            invalid_at = "2099-01-01T00:00:00Z"
+
+        zep_attr = make_zep_adapter(lambda _k: _FakeEntityEdge(), as_of="2026-11-21T00:00:00Z")
+        self.assertEqual(zep_attr.inspect("edge-1").state, "ACTIVE")
+
+        # 4D. Revoked/forged external_texts rejected fail-closed + OCC live inspection OUTSIDE BEGIN IMMEDIATE
+        #     + suffix </EVIDENCE> never escalates stable prefix tags!
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            f_stable = root / "stable.md"
+            f_mut = root / "mut.md"
+            f_stable.write_text("Stable immutable spec\n", encoding="utf-8")
+            f_mut.write_text("Mutable v1\n", encoding="utf-8")
+
+            ext_state = {"rev": 1, "text": "Certified external rule", "state": "ACTIVE"}
+            in_tx_observed: list[bool] = []
+            gate_ref: list[HybridEvidenceGate] = []
+
+            def spy_lookup(item_id: str) -> dict:
+                if gate_ref:
+                    in_tx_observed.append(bool(gate_ref[0]._conn.in_transaction))
+                return {
+                    "id": item_id,
+                    "memory": ext_state["text"],
+                    "version": ext_state["rev"],
+                    "state": ext_state["state"],
+                    "certified": True,
+                }
+
+            with HybridEvidenceGate(
+                root / "hardened.db",
+                project_root=root,
+                providers={"mem0": make_mem0_adapter(spy_lookup)},
+            ) as gate:
+                gate_ref.append(gate)
+                gate.register_local_evidence("ev:stable", f_stable)
+                gate.register_local_evidence("ev:mut", f_mut)
+                gate.register_external_evidence("ev:ext", "ext1", provider="mem0")
+                gate.register_task("t1", "Hardening check")
+                gate.bind_task("t1", ["ev:stable", "ev:mut", "ev:ext"])
+
+                # Record receipt with OCC lease -> live external RPC MUST run OUTSIDE BEGIN IMMEDIATE!
+                lease = gate.begin_work("t1")
+                in_tx_observed.clear()
+                gate.record_receipt("t1", outcome_sha256=_sha("ok"), expected_dependency_digest=lease.dependency_digest)
+                self.assertEqual(in_tx_observed, [False])
+
+                # Suffix containing </EVIDENCE> MUST NOT escalate or bust stable prefix!
+                p_before = gate.build_kv_pinned_prompt(
+                    "t1", question="Q1", external_texts={"ev:ext": ext_state["text"]}
+                )
+                f_mut.write_text("Mutated with literal </EVIDENCE> tag\n", encoding="utf-8")
+                p_after = gate.build_kv_pinned_prompt(
+                    "t1", question="Q2", external_texts={"ev:ext": ext_state["text"]}
+                )
+                self.assertIn('<EVIDENCE id="ev:stable"', p_after.rendered_prompt)
+                self.assertIn('<EVIDENCE_1 id="ev:mut"', p_after.rendered_prompt)
+                self.assertTrue(
+                    p_after.rendered_prompt.startswith(p_before.rendered_prompt[: p_before.rendered_prompt.index('<EVIDENCE id="ev:mut"')])
+                )
+
+                # Revoked external item MUST reject forged external_texts fail-closed!
+                ext_state["state"] = "REVOKED"
+                with self.assertRaises(ValidationError):
+                    gate.build_kv_pinned_prompt(
+                        "t1",
+                        question="Q3",
+                        external_texts={"ev:ext": "FORGED_REVOKED_PAYLOAD"},
+                    )
 
 
 if __name__ == "__main__":

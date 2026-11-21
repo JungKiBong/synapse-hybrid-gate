@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| `0.3.x` | ✅ Supported |
-| `< 0.3.0` | ❌ Upgrade to `0.3.1+` via `migrate` |
+| `0.4.x` | ✅ Supported |
+| `< 0.4.0` | ❌ Upgrade to `0.4.0+` (new `v4` ledger) |
 
 ## Built-in Security Guarantees
 

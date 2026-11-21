@@ -182,6 +182,8 @@ def make_mem0_adapter(
                 provider="mem0",
                 metadata=rec.metadata,
             )
+        if rec is None:
+            raise KeyError("mem0_item_not_found")
         if not isinstance(rec, Mapping):
             raise TypeError("invalid_mem0_record")
 
@@ -190,14 +192,17 @@ def make_mem0_adapter(
             raise ValidationError("missing_mem0_id")
         ver_raw = rec.get("version") if rec.get("version") is not None else rec.get("revision")
         revision = _strict_positive_int(ver_raw, default=1, field="mem0_version")
-        sha = _extract_verified_sha256(rec, text_field="memory", provider="mem0")
+        text_field = "memory" if rec.get("memory") is not None or rec.get("text") is None else "text"
+        sha = _extract_verified_sha256(rec, text_field=text_field, provider="mem0")
 
         deleted = _strict_bool(rec.get("deleted"), default=False, field="mem0_deleted")
         is_deleted = _strict_bool(rec.get("is_deleted"), default=False, field="mem0_is_deleted")
+        replaced_by = rec.get("replaced_by")
+        is_replaced = isinstance(replaced_by, str) and bool(replaced_by.strip())
         raw_state = rec.get("state", "ACTIVE")
         if raw_state not in ("ACTIVE", "REVOKED"):
             raise ValidationError("invalid_mem0_state")
-        state = "REVOKED" if (deleted or is_deleted or raw_state == "REVOKED") else "ACTIVE"
+        state = "REVOKED" if (deleted or is_deleted or is_replaced or raw_state == "REVOKED") else "ACTIVE"
         certified = _strict_bool(rec.get("certified"), default=False, field="mem0_certified")
         return ExternalMemoryItem(
             item_id=rec_id,
@@ -265,8 +270,28 @@ def make_zep_adapter(
                 provider="zep",
                 metadata=rec.metadata,
             )
+        if rec is None:
+            raise KeyError("zep_item_not_found")
         if not isinstance(rec, Mapping):
-            raise TypeError("invalid_zep_record")
+            # Support Graphiti EntityEdge / Pydantic / dataclass attribute objects
+            if hasattr(rec, "model_dump") and callable(rec.model_dump):
+                dumped = rec.model_dump()
+                if not isinstance(dumped, Mapping):
+                    raise TypeError("invalid_zep_record")
+                rec = dumped
+            elif any(hasattr(rec, attr) for attr in ("uuid", "id", "item_id")) and any(
+                hasattr(rec, attr) for attr in ("fact", "content_sha256")
+            ):
+                rec = {
+                    k: getattr(rec, k)
+                    for k in (
+                        "uuid", "id", "item_id", "revision", "version", "fact", "content_sha256",
+                        "state", "deleted_at", "invalid_at", "expired_at", "valid_at", "certified",
+                    )
+                    if hasattr(rec, k)
+                }
+            else:
+                raise TypeError("invalid_zep_record")
 
         rec_id = rec.get("uuid")
         if rec_id is None:
@@ -398,6 +423,8 @@ def make_mories_adapter(
                 provider="mories",
                 metadata=rec.metadata,
             )
+        if rec is None:
+            raise KeyError("mories_item_not_found")
         if not isinstance(rec, Mapping):
             raise TypeError("invalid_mories_record")
 

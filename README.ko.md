@@ -67,28 +67,28 @@
 
 </details>
 
-### 2. 엔진 런타임 · 보안 · 멀티프로세스 동시성 실측 지표 (`v0.3.1`)
+### 2. 엔진 런타임 · 보안 · 멀티프로세스 동시성 실측 지표 (`v0.4.0`)
 
 | 측정 항목 | 검증 수치 | 검증 범위 및 조건 |
 |---|---|---|
-| **통합 검증 시나리오** | **공개 내장 `26 / 26` PASS** + **릴리스 `32 / 32` PASS** | 공개 `tests/test_synapse_hybrid_gate.py`(`0.35초` 재현) + 클린 Wheel(`python3 -I -B`) 격리 실행 |
+| **통합 검증 시나리오** | **공개 내장 `32 / 32` PASS** | 공개 `tests/` (`0.44s`, `unittest`/`pytest`) — 무잠금 읽기, fail-closed `external_texts`, 쓰기 락 외부 OCC, 브레이커·SDK 회귀 |
 | **8개 병렬 서브에이전트 프리픽스 공유율 (`H07`)** | **`95.6%`** 바이트 완전 일치 | 공통 아키텍처 스펙 위에서 서로 다른 하위 과업을 병렬 수행하는 8개 서브에이전트 프롬프트 비교 |
 | **멀티프로세스 SQLite WAL 동시성 (`H08`)** | **6개 OS 프로세스 락·스냅샷 에러 `0`건** | 동시 `read_only=True` MVCC 스냅샷 워커 4개 + 동시 Writer 2개 병렬 실행 및 OCC 충돌 차단 확인 |
-| **메모리 점유율 및 실행 속도** | **Peak RSS `48.86 MiB`** (전체 스위트 `6.37초`) | 순수 Python `>=3.11` 표준 라이브러리만 사용 (외부 패키지 의존성 `0`개) |
-| **위변조 및 프롬프트 탈출 방어 (`H06`, `H07`)** | **`100%` 차단 (`HOLD` / `DENY`)** | 캐시 테이블·해시체인 영수증 이중 무결성 대조, 적대적 `</EVIDENCE>` 구분자 자동 승격(`EVIDENCE_1`), `O_NOFOLLOW` 심볼릭링크 차단, `0600` 권한 강제 |
+| **메모리 점유율 및 의존성** | **외부 런타임 의존성 `0`개** | 순수 Python `>=3.11` 표준 라이브러리만 사용(`dependencies = []`), `O(1)` RAM 스트리밍 `verify_chain()` |
+| **위변조 및 프롬프트 탈출 방어 (`H06`, `H07`)** | **`100%` 차단 (`HOLD` / `DENY`)** | 캐시 테이블·해시체인 영수증 이중 무결성 대조, Prefix/Suffix/Question 독립 XML 태그 승격, `O_NOFOLLOW`/`O_NONBLOCK` 방어, `0600` 권한 |
 
 ---
 
 ## 5분 빠른 시작 (Quickstart)
 
 ```bash
-pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.3.1
+pip install git+https://github.com/JungKiBong/synapse-hybrid-gate.git@v0.4.0
 # 또는 로컬 클론 후 API 키 없이 0.2초 만에 절감 데모 즉시 실행:
 pip install .
 python3 examples/demo_lossless_savings.py
 ```
 
-### 1. 단독 실행 무손실 LLM 캐싱 · KV-Prefix 고정 · 토큰 절감량 모니터링
+### 1. 단독 실행 무손실 LLM 캐싱 · 무잠금 KV-Prefix 고정
 
 ```python
 from synapse_hybrid_gate import HybridEvidenceGate
@@ -110,7 +110,7 @@ with HybridEvidenceGate("gate.db", project_root=".") as gate:
         plan.rendered_prompt,
         lambda prompt: ('{"safe": true}', 1800, 120),  # 실제 LLM API 호출 함수로 교체
     )
-    print(outcome.cache_hit, gate.token_monitoring_report())
+    print(outcome.cache_hit, outcome.saved_input_tokens, outcome.saved_output_tokens)
 ```
 
 ### 2. `Mem0`, `Zep/Graphiti`, `PostgreSQL`, `Mories` 범용 어댑터 연결 (락인 0%)
@@ -151,7 +151,7 @@ with HybridEvidenceGate("gate.db", project_root=".") as gate:
 
 ---
 
-## CLI 레퍼런스 및 실시간 토큰 절감량 조회 (`monitor`)
+## CLI 레퍼런스
 
 종료 코드(Exit Code): `0` (`ALLOW` / 정상), `2` (`HOLD` — 문서 변경·기억 철회·외부 어댑터 오프라인), `3` (`ERROR` / `DENY` / 해시체인 위변조 / 잘못된 CLI 인자).
 
@@ -167,11 +167,8 @@ synapse-hybrid-gate --db gate.db --project-root . cache-store --task-id task:t1 
 synapse-hybrid-gate --db gate.db --project-root . cache-lookup --task-id task:t1 --prompt-sha256 <SHA256>
 synapse-hybrid-gate --db gate.db --read-only check-task --task-id task:t1
 
-# 생략된 LLM 호출 수, 절약된 입·출력 토큰, 캐시 적중률(%), KV-Prefix 고정 토큰 실시간 리포트:
-synapse-hybrid-gate --db gate.db monitor --format table
-synapse-hybrid-gate --db gate.db monitor --format json
-
-# 무중단 온라인 SQLite 백업 (0600 권한, 심볼릭링크 차단) 및 영수증 해시체인 무결성 검증:
+# 원장 상태 조회, 무중단 온라인 SQLite 백업 (0600 권한, 심볼릭링크 차단) 및 스트리밍 해시체인 무결성 검증:
+synapse-hybrid-gate --db gate.db status
 synapse-hybrid-gate --db gate.db backup --dest gate.backup.db
 synapse-hybrid-gate --db gate.db verify-chain
 ```
@@ -188,6 +185,6 @@ python3 examples/demo_lossless_savings.py
 ## 기업 보안 및 아키텍처 경계 안내
 
 - **네트워크 가로채기 0% (Zero-Proxy / Zero-Daemon)**: 로컬 HTTP/HTTPS 프록시를 띄우거나 API 키·TLS 패킷을 가로채지 않으며 외부 포트를 일절 열지 않습니다. 사내 보안(DLP/EDR) 위반 우려 없이 Claude Code, Codex, OpenCode, Cursor 및 자체 Python 에이전트에 프로젝트 단위(Opt-in)로 안전하게 적용할 수 있습니다.
-- **파일시스템 및 원장 하드닝**: 지정된 `project_root` 경계 강제, 중간 경로 심볼릭 링크 거부(`lstat` + `O_NOFOLLOW`), 일반 파일 검증, 대용량 파일 DoS 상한(`max_file_bytes`, 기본 `64 MiB`), POSIX `0600` 소유자 전용 DB 권한, SHA-256 해시체인 영수증을 기본 적용합니다.
-- **명시적 스키마 마이그레이션**: 구버전(`v1`/`v2`) SQLite 원장을 열면 자동 변경 대신 `SchemaVersionError`로 안전하게 차단하며, `migrate_database(db_path)` 또는 `synapse-hybrid-gate --db gate.db migrate`로 명시적 승격을 수행합니다.
+- **파일시스템 및 원장 하드닝**: 지정된 `project_root` 경계 강제, 중간 경로 심볼릭 링크 거부(`lstat` + `O_NOFOLLOW` + `O_NONBLOCK`), 일반 파일 검증, 대용량 파일 DoS 상한(`max_file_bytes`, 기본 `64 MiB`), POSIX `0600` 소유자 전용 DB 권한, 무잠금 MVCC 읽기 경로, SHA-256 해시체인 영수증을 기본 적용합니다.
+- **엄격한 스키마 격리 (`v4`)**: 호환되지 않는 구버전(`v4` 이전) SQLite 원장을 열면 자동 변경 대신 `SchemaVersionError`로 안전하게 차단합니다.
 - 본 프로젝트는 **Apache License, Version 2.0** ([LICENSE](./LICENSE)) 라이선스로 배포됩니다.
